@@ -91,6 +91,11 @@ func (s *Scheduler) compTargets() []compTarget {
 			out = append(out, t)
 			continue
 		}
+		if a.IsRelay() {
+			t.skip, t.msg = compSkipGlobal, "中转账号无补偿体系"
+			out = append(out, t)
+			continue
+		}
 		if a.IsGlobal() {
 			t.skip, t.msg = compSkipGlobal, "国际版无 CN 补偿体系"
 			out = append(out, t)
@@ -180,6 +185,9 @@ func (s *Scheduler) ClaimCompensationFor(uid string) (CompensationResult, error)
 	a := s.cfg.Pool.AuthByUID(uid)
 	if a == nil || a.AccessTokenValue() == "" {
 		return skip(compSkipNoAuth, "无凭证")
+	}
+	if a.IsRelay() {
+		return skip(compSkipGlobal, "中转账号无补偿体系")
 	}
 	if a.IsGlobal() {
 		return skip(compSkipGlobal, "国际版无 CN 补偿体系")

@@ -10,7 +10,7 @@ let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
-let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'rate' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
@@ -350,13 +350,14 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', relay: '中转账号', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
+  if (v === 'relay') loadRelayList();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -700,7 +701,10 @@ function mdMatch(m, f) {
       if (!text.includes(kw)) return false;
     }
   }
-  if (f.realm && !String(m.id || '').startsWith(f.realm + ':')) return false;
+  if (f.realm) {
+    // relay 条目带 realm 字段（id 是「昵称:model」，前缀不再是固定枚举）；cn/global 按 id 前缀。
+    if (f.realm === 'relay' ? m.realm !== 'relay' : !String(m.id || '').startsWith(f.realm + ':')) return false;
+  }
   if (f.cap === 'tool' && !m.supports_tool_call) return false;
   if (f.cap === 'vision' && !m.supports_images) return false;
   if (f.cap === 'reasoning' && !m.supports_reasoning) return false;
@@ -828,9 +832,9 @@ function renderModels() {
 }
 
 function resetModelFilter() {
-  mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+  mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'rate' };
   $('mdQ').value = ''; $('mdRealm').value = ''; $('mdCap').value = '';
-  $('mdEffort').value = ''; $('mdPromo').value = ''; $('mdSort').value = 'default';
+  $('mdEffort').value = ''; $('mdPromo').value = ''; $('mdSort').value = 'rate';
   renderModels();
 }
 
@@ -847,6 +851,109 @@ for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'e
 }
 $('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = loadModels;
+
+/* ── 中转账号（relay） ─────────────────────────────────────────────── */
+async function loadRelayList() {
+  const tb = $('relayBody');
+  if (!tb) return;
+  tb.innerHTML = '<tr><td colspan="6"><div class="empty">加载中…</div></td></tr>';
+  try {
+    const d = await api('relay');
+    relaySavedModels = {};
+    if (!d.relays.length) { tb.innerHTML = '<tr><td colspan="6"><div class="empty">暂无中转账号</div></td></tr>'; return; }
+    tb.innerHTML = d.relays.map(r => {
+      relaySavedModels[r.uid] = r.models || [];
+      const md = (r.models && r.models.length) ? '<div class="note" style="margin-top:3px">已存模型 ' + r.models.length + ' 个</div>' : '';
+      return '<tr><td>' + esc(r.nickname || r.uid) + md + '</td><td class="num">' + esc(r.uid) + '</td>' +
+      '<td>' + esc(r.base_url) + '</td><td class="num">' + esc(r.key_mask) + '</td>' +
+      '<td>' + (r.disabled ? '<span class="tag warn">禁用</span>' : '<span class="tag ok">启用</span>') + '</td>' +
+      '<td><button class="xs" data-relay-models="' + esc(r.uid) + '">拉取模型</button> ' +
+      '<button class="xs ghost" data-relay-del="' + esc(r.uid) + '">删除</button></td></tr>';
+    }).join('');
+  } catch (e) {
+    tb.innerHTML = '<tr><td colspan="6"><div class="empty">加载失败：' + esc(e.message) + '</div></td></tr>';
+  }
+}
+$('btnRelayReload') && ($('btnRelayReload').onclick = loadRelayList);
+$('relayBody') && ($('relayBody').onclick = async ev => {
+  const del = ev.target.dataset && ev.target.dataset.relayDel;
+  if (del) {
+    if (!confirm('删除中转账号 ' + del + '？')) return;
+    try { await api('relay/delete', { method: 'POST', body: JSON.stringify({ uid: del }) }); loadRelayList(); }
+    catch (e) { toast('删除失败：' + e.message, 'err'); }
+    return;
+  }
+  const mid = ev.target.dataset && ev.target.dataset.relayModels;
+  if (!mid) return;
+  const row = ev.target.closest('tr');
+  const name = row.querySelector('td').textContent;
+  const saved = relaySavedModels[mid] || [];
+  try {
+    const d = await api('relay/models', { method: 'POST', body: JSON.stringify({ uid: mid }) });
+    const ids = d.models || [];
+    relayModelsOpen(mid, name, ids, saved);
+  } catch (e) { toast('拉取失败：' + e.message, 'err'); }
+});
+$('relayForm') && ($('relayForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const f = ev.target;
+  const payload = {
+    name: f.elements.name.value.trim(),
+    base_url: f.elements.base_url.value.trim(),
+    api_key: f.elements.api_key.value.trim(),
+  };
+  if (!payload.name || !payload.base_url || !payload.api_key) return;
+  try {
+    await api('relay/add', { method: 'POST', body: JSON.stringify(payload) });
+    $('relayNote').textContent = '已添加';
+    f.reset();
+    loadRelayList();
+  } catch (e) { $('relayNote').textContent = '添加失败：' + e.message; }
+});
+
+/* 中转站模型弹窗：表单「拉取模型」预览 / 列表行「拉取模型」勾选同步。
+   ctx.uid 空 = 未保存的表单预览（只展示）；有 uid = 同步到账号。 */
+let relayModelsCtx = { uid: '' };
+let relaySavedModels = {}; // uid → 已保存模型名单（列表加载时缓存，弹窗预勾选用）
+function relayModelsOpen(uid, who, models, checkedIds) {
+  relayModelsCtx = { uid };
+  $('relayModelsWho').textContent = who;
+  const pre = new Set(checkedIds || []);
+  const box = $('relayModelsList');
+  box.innerHTML = models.map(m =>
+    '<label class="realm-opt"><input type="checkbox" class="relay-md-chk" value="' + esc(m) + '"' + (pre.has(m) ? ' checked' : '') + '> <span style="font-family:var(--mono);font-size:11.5px">' + esc(m) + '</span></label>').join('');
+  const upd = () => { $('relayModelsCount').textContent = box.querySelectorAll('.relay-md-chk:checked').length + ' / ' + models.length + ' 已勾选'; };
+  box.onchange = upd;
+  $('btnRelayModelsAll').onclick = () => { box.querySelectorAll('.relay-md-chk').forEach(c => c.checked = true); upd(); };
+  $('btnRelayModelsNone').onclick = () => { box.querySelectorAll('.relay-md-chk').forEach(c => c.checked = false); upd(); };
+  upd();
+  $('relayModelsVeil').classList.add('on');
+}
+$('btnRelayModelsCancel').onclick = () => $('relayModelsVeil').classList.remove('on');
+$('btnRelayModelsSave').onclick = async () => {
+  const ids = [...document.querySelectorAll('#relayModelsList .relay-md-chk:checked')].map(c => c.value);
+  if (!relayModelsCtx.uid) { $('relayModelsVeil').classList.remove('on'); return; }
+  try {
+    await api('relay/models/sync', { method: 'POST', body: JSON.stringify({ uid: relayModelsCtx.uid, models: ids }) });
+    toast('已同步 ' + ids.length + ' 个模型到账号', 'ok');
+    $('relayModelsVeil').classList.remove('on');
+    loadRelayList();
+  } catch (e) { toast('同步失败：' + e.message, 'err'); }
+};
+// 表单「拉取模型」：用表单里的 base_url + key 临时探测（不落盘，仅预览）。
+$('btnRelayFetch') && ($('btnRelayFetch').onclick = async () => {
+  const f = $('relayForm');
+  const base = f.elements.base_url.value.trim().replace(/\/+$/, '');
+  const key = f.elements.api_key.value.trim();
+  if (!base || !key) { toast('请先填写 Base URL 和 API Key', 'err'); return; }
+  $('relayNote').textContent = '拉取中…';
+  try {
+    const d = await api('relay/probe', { method: 'POST', body: JSON.stringify({ base_url: base, api_key: key }) });
+    const ids = d.models || [];
+    relayModelsOpen('', '（预览：未保存账号）', ids);
+    $('relayNote').textContent = '拉取到 ' + ids.length + ' 个模型';
+  } catch (e) { $('relayNote').textContent = ''; toast('拉取失败：' + e.message, 'err'); }
+});
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
@@ -1127,6 +1234,8 @@ $('btnLogPin').onclick = () => {
 const CFG_MAP = {
   strategy_domestic: ['pool', 'strategy', 'domestic'],
   strategy_international: ['pool', 'strategy', 'international'],
+  preferred_realm: ['pool', 'preferred_realm'],
+  cross_domain_fallback: ['pool', 'cross_domain_fallback'],
   domestic_account_order: ['pool', 'account_order', 'domestic'],
   international_account_order: ['pool', 'account_order', 'international'],
   listen: ['listen'], api_key: ['api_key'],
@@ -1188,6 +1297,7 @@ async function loadConfig() {
       const v = dig(cfgLoaded, path);
       if (el.type === 'checkbox') el.checked = !!v;
       else if (Array.isArray(v)) el.value = v.join(', ');
+      else if (name === 'cross_domain_fallback') el.value = (v == null ? true : !!v) ? 'true' : 'false';
       else el.value = v == null ? (name.startsWith('strategy_') ? 'weighted_random' : '') : v;
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
@@ -1205,7 +1315,8 @@ function collectConfig() {
     else {
       const raw = el.value.trim();
       // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
-      if (name.endsWith('_account_order')) v = raw.split(/[,，\s]+/).filter(Boolean);
+      if (name === 'cross_domain_fallback') v = raw === 'false' ? false : true; // select 恒有值，布尔化照发
+      else if (name.endsWith('_account_order')) v = raw.split(/[,，\s]+/).filter(Boolean);
       else if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
@@ -3225,7 +3336,8 @@ function renderExpiry(d) {
    旧 state（升级后尚未跑过一轮余额刷新，或 Redis 快照来自旧版本）没有 buckets，
    退回只显示最早一批，保证卡片不空白；下一轮刷新后自动变成完整视图。 */
 function renderExpirySnapshot(d) {
-  const list = (d && d.accounts) || [];
+  // relay 中转账号无 workbuddy 积分/到期体系，到期提醒一律排除（uid 以 relay- 开头）。
+  const list = ((d && d.accounts) || []).filter(a => !String(a.uid || '').startsWith('relay-'));
   const hasBuckets = list.some(a => Array.isArray(a.credits_expiry_buckets) && a.credits_expiry_buckets.length);
   if (hasBuckets) {
     const isoDay = v => {

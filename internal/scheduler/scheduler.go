@@ -546,6 +546,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
+		if a.IsRelay() {
+			continue // 中转账号无 workbuddy 任务体系，不发起任何上游调用
+		}
 		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是
 		// 点亮 growth 连登天数 / 解锁 first_buddy 领养——这两者对企业号都是 403
 		// （「growth system is only available for personal users」），即**零收益**。
@@ -661,6 +664,9 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil {
 			continue
+		}
+		if a.IsRelay() {
+			continue // 中转账号无 workbuddy 计费体系，不发起 get-user-resource 查询
 		}
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {

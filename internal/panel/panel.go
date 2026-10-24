@@ -161,6 +161,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.registerRelayRoutes()
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -416,13 +417,15 @@ func (p *Panel) nicknames() map[string]string {
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 与 /v1/models 同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
-// （gateway 路由协议，前端显示的 id 就是调用时要填的完整 model 值）。
+// 与 /v1/models 同口径的合并输出：id 一律裸名去前缀，双域同名模型只出一条
+// （CN 目录在前，先到先得）。
 // 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	var fetchErrs []string
+	listed := map[string]bool{} // 双域同名裸 id 只出一条
+	hasRelay := false           // 池内有无中转账号（决定空目录时报错还是出 relay 名单）
 
 	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
 	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
@@ -433,6 +436,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				fetchErrs = append(fetchErrs, "cn: "+err.Error())
 			} else {
 				for _, mi := range infos {
+					listed[mi.ID] = true
 					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
 				}
 			}
@@ -450,6 +454,10 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				} else {
 					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
 					for _, mi := range infos {
+						if listed[mi.ID] {
+							continue // 双域同名模型已随 CN 目录出过一条，不再重复
+						}
+						listed[mi.ID] = true
 						out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
 					}
 				}
@@ -457,7 +465,27 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if len(out) == 0 {
+	// relay 中转账号：合并手动拉取后落盘的模型名单（id 裸名）。**不参与双域同名去重**：
+	// 中转模型与 cn/global 同名也很常见（如 glm-5.3），跳过会让它们永远不可见；面板视角
+	// 按 realm 列区分展示。不实时探测（probe 由中转账号页按钮触发）；无已存名单的账号跳过。
+	for _, s := range p.cfg.Pool.List() {
+		a := p.cfg.Pool.AuthByUID(s.UID)
+		if a == nil || a.Realm() != "relay" || len(a.Models) == 0 {
+			continue
+		}
+		hasRelay = true
+		for _, id := range a.Models {
+			out = append(out, map[string]any{
+				"id":        a.Nickname + ":" + id,
+				"name":      id,
+				"realm":     "relay",
+				"vendor":    a.Nickname,
+				"relay_uid": a.UID,
+			})
+		}
+	}
+
+	if len(out) == 0 && !hasRelay {
 		if len(fetchErrs) > 0 {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
 			return
@@ -468,12 +496,12 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
 
-// panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
-// context_length / max_output_tokens 走四级查找链，effort 档位按 realm 域取
-// EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models 同一口径，两侧不再漂移。
+// panelModelEntry 构造单个模型条目（两域共用）：id 为裸名（与 /v1/models 合并去前缀
+// 口径一致，双域同名模型由调用方去重），context_length / max_output_tokens 走四级
+// 查找链，effort 档位按 realm 域取 EffortListing（远端权威 ∪ 静态兜底表）。
 func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
 	entry := map[string]any{
-		"id":                   realm + ":" + mi.ID,
+		"id":                   mi.ID,
 		"name":                 mi.Name,
 		"default_effort":       mi.DefaultEffort,
 		"supported_efforts":    mi.Efforts,
@@ -671,6 +699,10 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	a := p.cfg.Pool.AuthByUID(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if a.IsRelay() {
+		writeErr(w, http.StatusBadRequest, "中转账号无 workbuddy 积分/余额体系，不支持余额刷新")
 		return
 	}
 	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
@@ -1010,9 +1042,16 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 
 	sem := make(chan struct{}, 3)
 	var wg sync.WaitGroup
+	rowCount := 0 // relay 账号被跳过后，实际写入 out 的行数
 	for i, s := range accts {
+		a := p.cfg.Pool.AuthByUID(s.UID)
+		if a != nil && a.IsRelay() {
+			continue // 中转账号无 workbuddy 积分包/到期体系，不发起上游查询
+		}
+		j := rowCount
+		rowCount++
 		wg.Add(1)
-		go func(i int, s pool.Status) {
+		go func(j, i int, s pool.Status) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -1021,24 +1060,25 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			a := p.cfg.Pool.AuthByUID(s.UID)
 			if a == nil {
 				it.Error = "account not loaded"
-				out[i] = it
+				out[j] = it
 				return
 			}
 			packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
 			if err != nil {
 				it.Error = err.Error()
-				out[i] = it
+				out[j] = it
 				return
 			}
 			it.Packages = packs
 			it.Remain = remain
 			it.Size = size
-			out[i] = it
-		}(i, s)
+			out[j] = it
+		}(j, i, s)
 	}
 	wg.Wait()
 
 	// 余额降序：多的在前，便于和少的对比。
+	out = out[:rowCount]
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
 }

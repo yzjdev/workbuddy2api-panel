@@ -240,8 +240,9 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.acc.md .who .nm { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.acc.md .who .nm .mid { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.acc.md .who { max-width: 280px; }
+.acc.md .who .nm { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.acc.md .who .nm .mid { min-width: 0; white-space: normal; word-break: break-all; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
@@ -630,6 +631,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
+      <li><a href="#relay" data-view="relay">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 5.5h11v5h-11z"/><path d="M5.5 5.5v5M10.5 5.5v5M8 2.8v2.7M8 10.5v2.7"/></svg>
+        中转账号</a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -789,6 +793,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="">全部域</option>
             <option value="cn">国内版 CN</option>
             <option value="global">国际版 Global</option>
+            <option value="relay">中转 Relay</option>
           </select>
           <select id="mdCap" aria-label="按能力筛选">
             <option value="">全部能力</option>
@@ -813,8 +818,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="discount">打折（非免费）</option>
           </select>
           <select id="mdSort" aria-label="排序方式">
+            <option value="rate" selected>积分倍率 低 → 高（默认）</option>
             <option value="default">上游默认顺序</option>
-            <option value="rate">积分倍率 低 → 高</option>
             <option value="context">上下文长度 大 → 小</option>
             <option value="output">最大输出 大 → 小</option>
             <option value="name">模型 ID A → Z</option>
@@ -933,6 +938,38 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
+    <!-- 中转账号 -->
+    <section class="view" id="view-relay" hidden>
+      <div class="box">
+        <header><h3>中转账号 <span class="hint">OpenAI 兼容网关，base url + key 直通；调用时模型名加 relay: 前缀</span></h3></header>
+        <div class="pad">
+          <form id="relayForm">
+            <div class="grid3">
+              <label class="fld"><span class="lb">名称</span>
+                <input name="name" placeholder="我的中转站" required></label>
+              <label class="fld"><span class="lb">Base URL</span>
+                <input name="base_url" placeholder="https://api.xx.com/v1" required>
+                <span class="hint">需含版本前缀，出站请求 {base}/chat/completions</span></label>
+              <label class="fld"><span class="lb">API Key</span>
+                <input name="api_key" type="password" placeholder="sk-..." required></label>
+            </div>
+            <div style="margin-top:10px"><button class="xs" type="submit">添加中转账号</button>
+              <button class="xs ghost" type="button" id="btnRelayFetch">拉取模型</button>
+              <span class="note" id="relayNote"></span></div>
+          </form>
+        </div>
+      </div>
+      <div class="box">
+        <header><h3>已添加</h3><span class="grow"></span>
+          <button class="xs" id="btnRelayReload">刷新</button></header>
+        <div class="tbl-wrap">
+          <table class="acc"><thead><tr>
+            <th>名称</th><th>UID</th><th>Base URL</th><th>Key</th><th>状态</th><th></th>
+          </tr></thead><tbody id="relayBody"></tbody></table>
+        </div>
+      </div>
+    </section>
+
     <!-- 配置 -->
     <section class="view" id="view-config" hidden>
       <form id="cfgForm">
@@ -1015,6 +1052,27 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
               <input type="checkbox" name="include_disabled_in_tasks"></div>
             <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。<br>若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。</div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>路由优先级</h3></header>
+          <div class="pad">
+            <div class="grid3">
+              <label class="fld"><span class="lb">裸模型名优先级</span>
+                <select name="preferred_realm">
+                  <option value="global">国际版 → 国内版（默认）</option>
+                  <option value="cn">国内版 → 国际版</option>
+                </select>
+                <span class="hint">不带 cn:/global: 前缀的请求优先路由所选域；显式前缀不受影响</span></label>
+              <label class="fld"><span class="lb">跨域回退</span>
+                <select name="cross_domain_fallback">
+                  <option value="true">开启（默认）</option>
+                  <option value="false">关闭</option>
+                </select>
+                <span class="hint">首选域选不到可用账号时自动改用另一域再选</span></label>
+            </div>
+            <div class="hint">路由顺序：<b>限时免费</b>的账号优先使用（实测免费的号不耗积分），其次<b>最近到期积分</b>的账号（批次耗尽后自动切到下一个最早到期账号），再按上面所选的域优先级路由，最后由跨域回退兜底。中转账号不参与此链路，仅 relay:/中转站名: 前缀点名时使用。两项保存后热生效。</div>
           </div>
         </div>
 
@@ -1332,6 +1390,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <button id="btnCopyUrl" hidden>复制链接</button>
       <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
       <button id="btnCloseAdd">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 中转站模型列表 -->
+<div class="veil" id="relayModelsVeil">
+  <div class="dlg" style="width:640px">
+    <header><h3>中转站模型 <span class="hint" id="relayModelsWho"></span></h3></header>
+    <div class="body">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <button class="xs ghost" id="btnRelayModelsAll">全选</button>
+        <button class="xs ghost" id="btnRelayModelsNone">全不选</button>
+        <span class="note" id="relayModelsCount"></span>
+      </div>
+      <div id="relayModelsList" style="max-height:46vh;overflow:auto;display:flex;flex-direction:column;gap:4px"></div>
+    </div>
+    <footer>
+      <button id="btnRelayModelsCancel">取消</button>
+      <button class="xs primary" id="btnRelayModelsSave">同步到账号</button>
     </footer>
   </div>
 </div>
