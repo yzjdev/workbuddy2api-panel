@@ -6,6 +6,9 @@
 //
 // 构建：需要 common controls v6 manifest（rsrc -manifest 生成 .syso），
 // 见 gui.manifest；无 manifest 时窗口仍可用但控件样式为旧版。
+// 双击运行不弹终端：以 windowsgui 子系统链接——
+//
+//	go build -ldflags "-H windowsgui" -o workbuddy2api-gui.exe ./cmd/gui
 package main
 
 import (
