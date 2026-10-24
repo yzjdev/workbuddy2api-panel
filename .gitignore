@@ -45,3 +45,8 @@ docs/
 *.zip
 server.exe
 .DS_Store
+
+# 桌面控制台构建产物
+*.exe
+*.exe~
+*.log
