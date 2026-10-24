@@ -6,19 +6,22 @@ import "strings"
 //
 //	分布式前缀： "[realm:]model"
 //
-// 取第一个 ":"，前段恰为 "cn"/"global" 才剥离；否则视为裸名，realm=cn、bare=原串。
-// 大小写敏感（前缀必须是精确的小写枚举）。bare 即出站/选号/账本使用的裸模型名。
+// 取第一个 ":"，前段恰为 "cn"/"global"/"relay" 时按枚举剥离；其余带 ":" 的前缀原样
+// 保留（prefix=原串、bare=原串），由调用方（handler）按中转站昵称匹配「中转站名:model」；
+// 无 ":" 视为裸名，realm=cn。bare 即出站/选号/账本使用的裸模型名。
 //
 // 第三个返回值 realmExplicit 供跨域回退（issue #135）判定：只有裸名（false）才允许
-// 在首选域选不到号时改用另一域；显式 cn:/global: 前缀永不被回退改写。
+// 在首选域选不到号时改用另一域；显式 cn:/global:/relay: 前缀永不被回退改写。
 func resolveModelDetail(model string) (realm, bare string, realmExplicit bool) {
 	idx := strings.IndexByte(model, ':')
 	if idx < 0 {
 		return "cn", model, false
 	}
 	prefix := model[:idx]
-	if prefix != "cn" && prefix != "global" {
-		return "cn", model, false
+	if prefix != "cn" && prefix != "global" && prefix != "relay" {
+		// 未知前缀：不当作裸名回落 cn（那会把 "站名:model" 整串当模型名打上游），
+		// 保留原串交由 handler 按中转站昵称二次匹配；匹配不到时报 model_unavailable。
+		return prefix, model, true
 	}
 	return prefix, model[idx+1:], true
 }

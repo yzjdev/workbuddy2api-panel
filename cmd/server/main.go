@@ -105,6 +105,7 @@ func main() {
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback) // 裸名跨域回退（issue #135，默认关闭）
+	p.SetPreferredRealm(cfg.Pool.PreferredRealm)           // 裸名首选域（cn/global，默认 cn）
 	_ = p.SetScheduling(cfg.Pool.Strategy, cfg.Pool.AccountOrder)
 
 	// 会话粘性路由（可配关闭）。
@@ -537,6 +538,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback) // 裸名跨域回退热生效（issue #135）
+	p.SetPreferredRealm(newCfg.Pool.PreferredRealm)           // 裸名首选域热生效（cn/global）
 	_ = p.SetScheduling(newCfg.Pool.Strategy, newCfg.Pool.AccountOrder)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(

@@ -384,19 +384,118 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	return entry
 }
 
-// modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
-// 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
+// relayChat 中转站直通 chat：relay: 或「中转站昵称:」前缀点名进入。OpenAI 兼容原样
+// 转发/回传（状态码+响应头+body 透传，SSE 逐块 flush），失败轮转换号，响应已写头后
+// 终止轮转。nick 前缀（非 "relay" 枚举）时只在该昵称的账号中轮换，出站模型名剥前缀。
+// 返回最终 HTTP 状态码（调用方记入 st.status）。
+func (h *Handler) relayChat(w http.ResponseWriter, r *http.Request, body []byte, tried map[string]bool, st *chatStat, nickPrefix, bareModel string) int {
+	if nickPrefix != "" {
+		body = rewriteModel(body, bareModel) // 出站剥「昵称:」前缀，上游只认裸名
+	}
+	for i := 0; i < h.cfg.MaxRotate; i++ {
+		acct := h.pickRelay(tried, nickPrefix)
+		if acct == nil {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", "没有可用中转站账号")
+			return http.StatusServiceUnavailable
+		}
+		tried[acct.UID] = true
+		if !h.cfg.Pool.Acquire(acct.UID) {
+			continue // 并发抢名额失败 → 换号
+		}
+		st.uid, st.nick = acct.UID, acct.Nickname
+		resp, err := h.cfg.Upstream.ChatRelay(r.Context(), acct, body)
+		if err != nil {
+			h.cfg.Pool.NoteError(acct.UID)
+			h.cfg.Pool.Release(acct.UID)
+			continue
+		}
+		st.status = resp.StatusCode
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		rc := resp.Body
+		if f, ok := w.(http.Flusher); ok {
+			buf := make([]byte, 4096)
+			for {
+				n, rerr := rc.Read(buf)
+				if n > 0 {
+					_, _ = w.Write(buf[:n])
+					f.Flush()
+				}
+				if rerr != nil {
+					break
+				}
+			}
+		} else {
+			_, _ = io.Copy(w, rc)
+		}
+		_ = rc.Close()
+		h.cfg.Pool.Release(acct.UID)
+		if resp.StatusCode >= 400 {
+			h.cfg.Pool.NoteError(acct.UID) // 错误透传给客户端，同时罚号进入冷却
+			st.outcome = reqlog.OutcomeHTTPError
+			return resp.StatusCode
+		}
+		return resp.StatusCode
+	}
+	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", "中转站账号均不可用")
+	return http.StatusServiceUnavailable
+}
+
+// hasRelayNick 报告昵称是否命中任一中转账号（大小写不敏感）。
+func (h *Handler) hasRelayNick(nick string) bool {
+	for _, s := range h.cfg.Pool.List() {
+		a := h.cfg.Pool.AuthByUID(s.UID)
+		if a != nil && a.Realm() == "relay" && strings.EqualFold(a.Nickname, nick) {
+			return true
+		}
+	}
+	return false
+}
+
+// pickRelay 中转账号轮换选号：nickPrefix 空 = 全部 relay 账号；非空 = 只在该昵称的
+// 账号中选（大小写不敏感）。昵称是账号添加时的展示名，不唯一时多号同轮换。
+func (h *Handler) pickRelay(tried map[string]bool, nickPrefix string) *auth.Auth {
+	if nickPrefix == "" {
+		return h.cfg.Pool.PickExcludingForRealm(tried, "", "relay")
+	}
+	for _, s := range h.cfg.Pool.List() {
+		if s.Disabled || tried[s.UID] {
+			continue
+		}
+		a := h.cfg.Pool.AuthByUID(s.UID)
+		if a == nil || a.Realm() != "relay" || !strings.EqualFold(a.Nickname, nickPrefix) {
+			continue
+		}
+		if !h.cfg.Pool.Acquire(s.UID) {
+			tried[s.UID] = true
+			continue
+		}
+		h.cfg.Pool.Release(s.UID)
+		return a
+	}
+	return nil
+}
+
+// modelList 模型列表：双域名单合并输出，id 一律不带 "cn:"/"global:" 前缀（裸名即
+// 首选域路由，配合 pool.preferred_realm / cross_domain_fallback；显式前缀仍可点域）。
+// 同名模型双域都有时只出一条（先到先得，CN 目录在前）。黑名单仍按 "realm:id" 键。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	// models.hidden 黑名单：快照外提，避免逐条目重复 Load。
 	hidden := h.loadLive().HiddenModels
+	listed := map[string]bool{} // 合并去重：同名裸 id 双域只出一条
 	for _, mi := range h.fetchDynamicModels() {
 		if _, ok := hidden["cn:"+mi.ID]; ok {
 			continue
 		}
+		listed[mi.ID] = true
 		entry := map[string]any{
-			"id":       "cn:" + mi.ID,
+			"id":       mi.ID,
 			"object":   "model",
 			"created":  1753600000,
 			"owned_by": "workbuddy",
@@ -438,11 +537,15 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
+			if listed[id] {
+				continue // 双域同名模型已随 CN 目录出过一条，不再重复
+			}
 			if _, ok := hidden["global:"+id]; ok {
 				continue
 			}
+			listed[id] = true
 			entry := map[string]any{
-				"id":       "global:" + id,
+				"id":       id,
 				"object":   "model",
 				"created":  1753600000,
 				"owned_by": "workbuddy",
@@ -464,6 +567,28 @@ func (h *Handler) modelList() []map[string]any {
 				}
 			}
 			out = append(out, entry)
+		}
+	}
+	// relay 中转账号：合并手动拉取后落盘的模型名单，id 输出为「昵称:模型」——
+	// 昵称前缀是网关路由协议（chatCompletions 按「中转站名:模型」直通对应账号），
+	// 客户端复制列表里的 id 即可直接调用。不参与 cn/global 同名去重（中转模型与
+	// 主站同名很常见，跳过会让它们在 /v1/models 里不可见）；不实时探测上游
+	//（名单由中转账号页「拉取模型」手动同步落盘）。
+	for _, s := range h.cfg.Pool.List() {
+		if s.Disabled {
+			continue
+		}
+		a := h.cfg.Pool.AuthByUID(s.UID)
+		if a == nil || a.Realm() != "relay" || len(a.Models) == 0 {
+			continue
+		}
+		for _, id := range a.Models {
+			out = append(out, map[string]any{
+				"id":       a.Nickname + ":" + id,
+				"object":   "model",
+				"created":  1753600000,
+				"owned_by": "relay/" + a.Nickname,
+			})
 		}
 	}
 	return out
@@ -581,6 +706,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel, realmExplicit := resolveModelDetail(peek.Model)
+	// preferred_realm（裸名首选域）：裸名默认 cn；配置 global 时裸名请求整体按
+	// global 路由（选号/粘性/黑名单键/倍率口径一致），显式 cn:/global: 前缀不受影响。
+	// 设 global 后建议同时开启 cross_domain_fallback，global 不可用时回落 cn。
+	if !realmExplicit {
+		realm = h.cfg.Pool.PreferredRealm()
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -616,6 +747,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
+
+	// relay 直通分支：relay: 枚举前缀，或「中转站昵称:模型」自定义前缀点名
+	// （设计确认：中转站不参与裸名自动轮换）。OpenAI 兼容原样转发/回传，
+	// 不走 workbuddy 协议翻译、不刷新 token。
+	if realm == "relay" {
+		st.status = h.relayChat(w, r, body, tried, st, "", bareModel)
+		return
+	}
+	if realmExplicit && realm != "cn" && realm != "global" {
+		// 未知前缀 = 按中转站昵称匹配（resolveModelDetail 已保留原串）。
+		// 昵称命中 relay 账号 → 昵称直通；否则报模型不可用（避免误当裸名打 workbuddy 上游）。
+		if h.hasRelayNick(realm) {
+			nickBare := bareModel
+			if idx := strings.IndexByte(peek.Model, ':'); idx >= 0 {
+				nickBare = peek.Model[idx+1:] // 出站剥「昵称:」前缀，上游只认裸名
+			}
+			st.status = h.relayChat(w, r, body, tried, st, realm, nickBare)
+			return
+		}
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
+			"model prefix "+realm+" does not match any relay account; use relay:<model> or <relay-nickname>:<model>", "")
+		st.status = http.StatusBadRequest
+		st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -827,6 +983,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 在途占满），而另一域有 → 直接换域选号（issue #135）。先看健康度再选，
 				// 避免拿全冷却兜底捞回来的旧域账号白撞一次上游。
 				pickRealm = otherRealm(realm)
+			}
+			// 积分到期优先跨域切换：域过滤发生在 pick 之前，仅按 preferred_realm
+			// 选号会让另一域「更早到期」的积分闲置到过期（实测：唯一 global 号的
+			// 最早批次 11-15 晚于 cn 号的 11-08，裸名请求永远打不到 cn 号）。
+			// 刻意不依赖 cross_domain_fallback（那是「首选域选不到号」的兜底开关）：
+			// 到期优先语义压过域优先级，无条件比较两域最早到期时间，更早者胜。
+			// 模型级可用性仍由 PickExcludingForRealm 的 healthyForModel 把关
+			//（该模型在目标域无号时自然回落原域）。
+			if eOther, eSelf := h.cfg.Pool.EarliestExpiryForRealm(otherRealm(pickRealm)), h.cfg.Pool.EarliestExpiryForRealm(pickRealm); !eOther.IsZero() &&
+				(eSelf.IsZero() || eOther.Before(eSelf)) {
+				pickRealm = otherRealm(pickRealm)
 			}
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, pickRealm)
 			if acct == nil && crossRealm {

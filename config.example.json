@@ -95,7 +95,8 @@
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",
     "credit_floor": 100,
-    "cross_domain_fallback": false
+    "cross_domain_fallback": true,
+    "preferred_realm": "global"
   },
   "session_sticky": {
     "enabled": true,

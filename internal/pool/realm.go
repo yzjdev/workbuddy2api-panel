@@ -63,6 +63,33 @@ func (p *Pool) ServableForModelRealm(model, realm string) int {
 	return n
 }
 
+// EarliestExpiryForRealm 返回指定域内「最早到期积分批次仍有余额」的账号中，
+// 最早批次时间（零值 = 该域没有此类账号）。relay 账号无积分批次，天然不参与。
+// 供 handler 在 cross_domain_fallback 开启时比较两域到期压力：另一域的积分
+// 更早到期 → 选号域切过去，让即将作废的积分优先消耗。
+func (p *Pool) EarliestExpiryForRealm(realm string) time.Time {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	var earliest time.Time
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if e.disabled || e.paused || !e.healthy(now) || p.inFlightFull(e) {
+			continue
+		}
+		if e.creditsEarliestRemaining > 0 &&
+			!e.creditsEarliestExpiry.IsZero() &&
+			e.creditsEarliestExpiry.After(now) {
+			if earliest.IsZero() || e.creditsEarliestExpiry.Before(earliest) {
+				earliest = e.creditsEarliestExpiry
+			}
+		}
+	}
+	return earliest
+}
+
 // WeightedAvailableUIDsForModelRealm 返回带虚拟实例权重的可用账号列表。
 //
 // 普通账号出现 1 次；有效快过期账号出现 expiringVirtualSlots 次。调用方继续按

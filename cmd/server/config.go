@@ -234,12 +234,18 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
-		// CrossDomainFallback 裸模型名跨域回退开关（issue #135），默认 false（零回归）。
-		// 开启后：请求模型名不带 realm 前缀时，首选域（cn）选不到可用账号（账号级冷却/
+		// CrossDomainFallback 裸模型名跨域回退开关（issue #135），缺省 true。
+		// 开启后：请求模型名不带 realm 前缀时，首选域选不到可用账号（账号级冷却/
 		// 熔断/在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）会自动改用
-		// 另一域再选一次；显式 cn:/global: 前缀不受影响，行为与引入前完全一致。
-		// 语义取舍：跨域会消耗另一个域的额度，属策略选择，故默认关闭、显式开启。
+		// 另一域再选一次；显式 cn:/global: 前缀不受影响，永不回退。
+		// 语义取舍：跨域会消耗另一个域的额度，属策略选择，默认开启以配合
+		// preferred_realm=global（国际版优先、国内版兜底）；纯 CN 锁定可显式关闭。
 		CrossDomainFallback bool `json:"cross_domain_fallback"`
+		// PreferredRealm 裸模型名首选域（"cn"/"global"，缺省 global = 账号优先使用
+		// 国际版）：不带 cn:/global: 前缀的请求整体按 global 路由（选号/粘性/黑名单
+		// 键/倍率口径一致），global 域不可用时经 cross_domain_fallback 回落 cn。
+		// 显式 "cn" 恢复国内版优先。非法值启动报错。
+		PreferredRealm string `json:"preferred_realm"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -317,6 +323,13 @@ func Default() *Config {
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
 	// 的 0 没有合理语义，回退分档默认最稳）。
 	c.Pool.MaxInFlightGlobal = 2
+	// 跨域回退缺省 true：裸模型名在首选域选不到号时改用另一域再选（issue #135）。
+	// 配合 preferred_realm=global（裸名优先国际版、国内版兜底）；显式 false 可关闭。
+	c.Pool.CrossDomainFallback = true
+	// 裸模型名首选域缺省 global（账号优先使用国际版）：不带前缀的请求整体按 global
+	// 路由，global 不可用时经 cross_domain_fallback 回落 cn；显式 cn:/global: 前缀
+	// 永不回退。
+	c.Pool.PreferredRealm = "global"
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
@@ -497,6 +510,15 @@ func (c *Config) normalize() error {
 	var err error
 	if c.Pool.Strategy, err = c.Pool.Strategy.Normalize(); err != nil {
 		return fmt.Errorf("pool.strategy: %w", err)
+	}
+	switch v := strings.ToLower(strings.TrimSpace(c.Pool.PreferredRealm)); v {
+	case "", "global":
+		// 键缺席也回落 global（账号优先国际版）；显式 "cn" 才走国内版优先。
+		c.Pool.PreferredRealm = "global"
+	case "cn":
+		c.Pool.PreferredRealm = "cn"
+	default:
+		return fmt.Errorf("pool.preferred_realm: %q 非法（仅支持 cn/global）", c.Pool.PreferredRealm)
 	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5

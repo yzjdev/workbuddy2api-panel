@@ -1774,21 +1774,32 @@ func TestPickPrefersExpiringByVirtualWeight(t *testing.T) {
 	p.SetCreditsDetailed("soon", 100, 100, 100, now.Add(2*time.Hour), 100)
 	p.SetCreditsDetailed("none", 100, 100, 0, time.Time{}, 0)
 
-	// 3:1 虚拟实例是软偏好而非硬优先。用确定性随机源统计长期分布：两个快过期
-	// 账号的合计份额应显著高于普通账号，同时普通账号仍保留少量流量。
+	// 积分到期优先是硬分层 + 层内按最早到期收窄：先用最近到期的积分。soon（2h）
+	// 比 later（48h）更早到期 → 层内只保留 soon；关闭开关后恢复普通加权路由（三号都参与）。
 	rng := rand.New(rand.NewPCG(1, 2))
 	p.SetRandomSource(func(n int64) int64 { return rng.Int64N(n) })
 	counts := map[string]int{}
-	for i := 0; i < 2000; i++ {
+	for i := 0; i < 500; i++ {
 		got := p.Pick()
 		if got == nil {
 			t.Fatal("pick returned nil")
 		}
 		counts[got.UID]++
 	}
-	expiring := counts["soon"] + counts["later"]
-	if expiring < 1500 || counts["none"] == 0 {
-		t.Fatalf("virtual weight distribution=%v, want expiring majority and regular non-zero", counts)
+	if counts["soon"] != 500 || counts["later"] != 0 || counts["none"] != 0 {
+		t.Fatalf("earliest-expiry layer distribution=%v, want soon-only", counts)
+	}
+	p.SetPreferExpiring(false)
+	counts = map[string]int{}
+	for i := 0; i < 500; i++ {
+		got := p.Pick()
+		if got == nil {
+			t.Fatal("pick returned nil")
+		}
+		counts[got.UID]++
+	}
+	if counts["none"] == 0 || counts["later"] == 0 {
+		t.Fatalf("layer disabled distribution=%v, want regular accounts participating", counts)
 	}
 }
 

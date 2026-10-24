@@ -64,6 +64,10 @@ type Pool struct {
 	// 仅由选号调用方（server handler）读取：开启后，未带 realm 前缀的请求在首选域
 	// 选不到可用号时改用另一域再选一次；显式 cn:/global: 前缀不受影响。
 	crossDomainFallback bool
+	// preferredRealm 裸模型名首选域（"cn"/"global"，默认 cn = 现状零回归）。
+	// 仅由 server handler 读取：裸名请求的 realm 默认值由它决定；显式 cn:/global:
+	// 前缀不受影响。设为 global 即「账号优先使用国际版」。
+	preferredRealm string
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -214,6 +218,27 @@ func (p *Pool) CrossDomainFallback() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.crossDomainFallback
+}
+
+// SetPreferredRealm 注入裸模型名首选域（"cn"/"global"，空 = 回落 cn）。
+// 与其它 pool.* 参数一致，面板保存配置后经同一条热应用路径立即生效。
+func (p *Pool) SetPreferredRealm(realm string) {
+	if realm != "global" {
+		realm = "cn"
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.preferredRealm = realm
+}
+
+// PreferredRealm 报告裸模型名首选域（handler 只读，热改安全）。
+func (p *Pool) PreferredRealm() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.preferredRealm == "" {
+		return "cn"
+	}
+	return p.preferredRealm
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

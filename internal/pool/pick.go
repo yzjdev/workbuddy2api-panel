@@ -110,6 +110,54 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 		return 2, mc.CostPer1k
 	}
+	// 限时免费优先硬分层：候选中存在「该模型实测免费」的账号（costTier tier0，
+	// 观测 TTL 内有效——限免/夜间免费过期后自然退出 tier0）时，本轮选号硬限定在其间。
+	// 语义：免费请求不消耗积分，压过到期分层与域优先级——把请求打到收费号上会
+	// 白白扣「最近到期」的积分，而免费号的积分分文不动。reqModel 为空（粘性解析
+	// 等路径）时不分层（无模型无成本观测）。
+	// 刻意**延迟到探索判定之后**才应用（见下方 freeLayerApply）：tier0 垄断时
+	// 条件探索会把生效层切到 tier1 去发现未知号成本，免费层必须让位，否则
+	// 未知号永远学不到成本、探索机制被锁死。
+	freeLayerActive := reqModel != "" && func() bool {
+		for _, e := range cands {
+			if ti, _ := costTier(e); ti == 0 {
+				return true
+			}
+		}
+		return false
+	}()
+	// 积分到期优先硬分层（prefer_expiring 开启时）：候选中存在「最早到期积分批次
+	// 仍有余额」的账号（relay 无积分批次，earliestExpiringNow 恒 false 天然排除）时，
+	// 本轮选号硬限定在其间——先用完最近到期的积分，用完（批次过期/耗尽）后该层自然
+	// 变空，选号回落普通加权路由，即按 preferred_realm 的国际版/国内版优先级继续。
+	// 刻意与 expiring_soon 窗口解耦：窗口只控制 routingWeightOf 的软偏好加成；
+	// 硬分层语义是「永远先用最早到期的积分，别等它过期」（账号最早批次普遍在
+	// 7 天窗口之外，按窗口判定会让分层常年空转）。与 costTier 正交：到期层内部
+	// 仍走成本分层与加权抽签。freeLayerActive 时跳过（免费号不耗积分，到期分层让位）。
+	expiringLayer := !freeLayerActive && p.preferExpiring && func() bool {
+		for _, e := range cands {
+			if earliestExpiringNow(e, now) {
+				return true
+			}
+		}
+		return false
+	}()
+	if expiringLayer {
+		cands = filterSlice(cands, earliestExpiringNow, now)
+		// 层内再收窄：只保留最早到期时间最小（同刻并列）的账号——「最近到期积分
+		// 优先使用」要求层内也按到期先后排序，而非按余额权重随机（否则最晚到期的
+		// 账号可能被随机选中，最早到期的积分反而闲置到过期）。min 变化（当前最早
+		// 批次耗尽/过期）后自动切换到下一批账号。
+		var minExpire time.Time
+		for _, e := range cands {
+			if minExpire.IsZero() || e.creditsEarliestExpiry.Before(minExpire) {
+				minExpire = e.creditsEarliestExpiry
+			}
+		}
+		cands = filterSlice(cands, func(e *entry, _ time.Time) bool {
+			return e.creditsEarliestExpiry.Equal(minExpire)
+		}, now)
+	}
 	bestTier := 2
 	hasTier1 := false
 	explored := false // 本次 pick 是否切了探索层（事件日志在选中号确定后打）
@@ -142,6 +190,18 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			bestTier = 1
 			explored = true
 		}
+	}
+	// 限时免费层应用点（延迟到探索判定之后）：探索未激活时，若存在 tier0 账号
+	// 则硬限定在其间；探索激活（bestTier==1）时让位——本次 pick 本来就是在
+	// tier1 里发现未知号成本，免费层不该把它压回去。
+	freeLayerApply := freeLayerActive && bestTier != 1
+	if freeLayerApply {
+		cands = filterSlice(cands, func(e *entry, _ time.Time) bool {
+			ti, _ := costTier(e)
+			return ti == 0
+		}, now)
+		// 层内重算最优 tier（恒为 0，探索日志口径不漂移）。
+		bestTier = 0
 	}
 	// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n) 次
 	// 冗余浮点计算（46 账号约 500 次）。先做 O(n) 预计算，再按 (权重, uid) 排序。
@@ -440,12 +500,33 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	return w
 }
 
-// expiringNow 报告账号是否存在当前仍有效的快过期积分批次。
+// expiringNow 报告账号是否存在当前仍有效的快过期积分批次（expiring_soon 窗口口径，
+// 供 routingWeightOf 软偏好使用）。
 func expiringNow(e *entry, now time.Time) bool {
 	return e.creditsExpiring > 0 &&
 		e.creditsEarliestRemaining > 0 &&
 		!e.creditsEarliestExpiry.IsZero() &&
 		e.creditsEarliestExpiry.After(now)
+}
+
+// earliestExpiringNow 报告账号的最早到期积分批次是否仍有余额且未过期。
+// 刻意不要求 creditsExpiring>0（窗口口径）：积分到期优先硬分层关心的是
+// 「最早那批积分还没用掉」，无论距今 3 天还是 30 天——先用掉即将作废的积分。
+func earliestExpiringNow(e *entry, now time.Time) bool {
+	return e.creditsEarliestRemaining > 0 &&
+		!e.creditsEarliestExpiry.IsZero() &&
+		e.creditsEarliestExpiry.After(now)
+}
+
+// filterSlice 按 expiringNow 谓词过滤候选集（积分到期优先硬分层的实现细节）。
+func filterSlice(cands []*entry, keep func(*entry, time.Time) bool, now time.Time) []*entry {
+	out := make([]*entry, 0, len(cands))
+	for _, e := range cands {
+		if keep(e, now) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false

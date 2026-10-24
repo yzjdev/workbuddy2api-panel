@@ -44,6 +44,13 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// BaseURL 中转站账号（realm="relay"）的 OpenAI 兼容上游 base，如 https://api.xx.com/v1。
+	// 仅 relay 账号使用；出站 POST {base}/chat/completions + Bearer AccessToken（=中转站 key）。
+	BaseURL string
+
+	// Models 中转站账号的模型名单（手动拉取后落盘，面板展示/同步用；不参与网关路由校验）。
+	Models []string
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -121,6 +128,9 @@ func (a *Auth) Realm() string {
 // 锁内再调 Realm() 会自锁）。realm 由 BackfillRealm 改写、Domain 由 RefreshToken 在锁内
 // 改写，故读取必须与写方同锁（理由见 AccessTokenValue 注释）。
 func (a *Auth) realmLocked() string {
+	if a.realm == "relay" {
+		return "relay" // 中转站账号：独立出站路径，不受 global 逃生门影响
+	}
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -128,6 +138,14 @@ func (a *Auth) realmLocked() string {
 		return "global"
 	}
 	return "cn"
+}
+
+// IsRelay 报告账号是否为中转站账号（realm=relay）。relay 无 workbuddy 任务体系
+// （签到/旅行/活跃/黑猫/补偿/余额），调度任务必须跳过，不向上游发起任何调用。
+func (a *Auth) IsRelay() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realmLocked() == "relay"
 }
 
 // ResolveRealm 归一化 realm（cn/global）：显式非空优先，否则按原始 domain 推断
@@ -295,6 +313,8 @@ func Parse(raw []byte) (*Auth, error) {
 				ExpiresAt    int64  `json:"expiresAt"`
 				Domain       string `json:"domain"`
 				Realm        string `json:"realm"`
+				BaseURL      string `json:"base_url"`
+				Models       []string `json:"models"`
 			} `json:"auth"`
 			Account struct {
 				UID          string `json:"uid"`
@@ -317,6 +337,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			BaseURL:      n.Auth.BaseURL,
+			Models:       n.Auth.Models,
 		}
 	} else {
 		var f struct {
@@ -329,6 +351,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
 			DeviceToken  string `json:"device_token"`
+			BaseURL      string `json:"base_url"`
+			Models       []string `json:"models"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -343,6 +367,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			BaseURL:      f.BaseURL,
+			Models:       f.Models,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -370,6 +396,8 @@ func (a *Auth) SaveAtomic() error {
 			"expiresAt":    a.ExpiresAt,
 			"domain":       a.Domain,
 			"realm":        a.realm,
+			"base_url":     a.BaseURL,
+			"models":       a.Models,
 		},
 		"account": map[string]any{
 			"uid":          a.UID,
@@ -411,6 +439,12 @@ func LoadDir(dir string) ([]*Auth, error) {
 	if err != nil {
 		return nil, err
 	}
+	// relay-*.json：中转账号（realm=relay，base_url+key），与 workbuddy 凭证同目录共存。
+	relayFiles, err := filepath.Glob(filepath.Join(dir, "relay-*.json"))
+	if err != nil {
+		return nil, err
+	}
+	files = append(files, relayFiles...)
 	// seenUID 重复 UID 检测：同 UID 出现在多个文件时（双 realm 同名 UID 概率近零）
 	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
 	seenUID := make(map[string]string, len(files))
