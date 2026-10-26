@@ -154,6 +154,24 @@ func serverAddr(listen string) string {
 	return listen
 }
 
+// lanIP 探测本机局域网 IPv4（第一个非 loopback、非链路本地的地址），找不到返回空串。
+func lanIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			ip := ipn.IP.To4()
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			return ip.String()
+		}
+	}
+	return ""
+}
+
 // serverProcessExists 报告网关映像是否在运行（可能由上次 GUI 或外部启动）。
 func serverProcessExists() bool {
 	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq "+serverBin, "/NH")
@@ -244,11 +262,27 @@ func main() {
 	// 太长会把窗口撑宽——walk 会把窗口扩张到内容最小宽，最小化恢复时尤其明显）。
 	urlShort := "127.0.0.1" + listen + "/v1"
 	urlFull := "http://" + urlShort
+	// 局域网地址：仅当服务监听所有网卡（:port / 0.0.0.0:port）时才可从局域网访问。
+	lanHost := lanIP()
+	lanReachable := strings.HasPrefix(listen, ":") || strings.HasPrefix(listen, "0.0.0.0:")
+	lanShort := ""
+	lanFull := ""
+	if lanHost != "" && lanReachable {
+		lanShort = lanHost + listen + "/v1"
+		lanFull = "http://" + lanShort
+	}
 
 	var mw *walk.MainWindow
 	var dot *walk.Label
-	var urlLbl, keyLbl *walk.Label
-	var btnCopyURL, btnCopyKey *walk.PushButton
+	var urlLbl, keyLbl, lanLbl *walk.Label
+	var btnCopyURL, btnCopyKey, btnCopyLAN *walk.PushButton
+	// 无局域网地址（探测失败）或仅绑定本机回环时给出说明文案。
+	lanText := "不可用（仅本机回环监听）"
+	if lanShort != "" {
+		lanText = lanShort
+	} else if lanHost == "" {
+		lanText = "未检测到局域网网卡"
+	}
 
 	// 状态点颜色：walk 的 WM_CTLCOLORSTATIC 由 ContainerBase 处理，而状态点是
 	// 主窗口的直接子控件，FormBase 不处理该消息，Label.SetTextColor / 声明式
@@ -289,6 +323,14 @@ func main() {
 					PushButton{AssignTo: &btnCopyURL, Text: "复制", MinSize: Size{Width: 44, Height: 20}, OnClicked: func() {
 						walk.Clipboard().SetText(urlFull)
 						flashCopied(btnCopyURL)
+					}},
+					Label{Text: "局域网:"},
+					Label{AssignTo: &lanLbl, Text: lanText, Font: Font{PointSize: 8, Family: "Consolas"}},
+					PushButton{AssignTo: &btnCopyLAN, Text: "复制", MinSize: Size{Width: 44, Height: 20}, OnClicked: func() {
+						if lanFull != "" {
+							walk.Clipboard().SetText(lanFull)
+						}
+						flashCopied(btnCopyLAN)
 					}},
 					Label{Text: "Key:"},
 					Label{AssignTo: &keyLbl, Text: maskKey(apiKey), Font: Font{PointSize: 8, Family: "Consolas"}},
