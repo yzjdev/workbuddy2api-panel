@@ -436,7 +436,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.realm === 'qoder' ? ' <span class="realm-tag">Qoder 国内</span>' : '') + (s.realm === 'qoder_global' ? ' <span class="realm-tag">Qoder 国际</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -807,8 +807,11 @@ function mdRowHtml(m, pr) {
   if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+  const realmTag = (m.realm === 'relay' && m.vendor) ? ' <span class="realm-tag">' + esc(m.vendor) + '</span>'
+    : (m.realm === 'qoder' ? ' <span class="realm-tag">Qoder 国内</span>'
+    : (m.realm === 'qoder_global' ? ' <span class="realm-tag">Qoder 国际</span>' : ''));
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + realmTag + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -1401,10 +1404,73 @@ function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
+  $('addTabQoder').hidden = tab !== 'qoder';
+  // 主 footer 按钮仅属于浏览器登录 tab；qoder tab 自带按钮
+  $('btnStartLogin').hidden = tab !== 'login' || $('btnStartLogin').dataset.done === '1';
+  $('btnCopyUrl').hidden = tab !== 'login';
+  $('btnOpenUrl').hidden = tab !== 'login';
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
 });
+
+// ---- Qoder 添加账号（OAuth 设备授权 + PAT 导入）----
+let qoderState = null, qoderTimer = null;
+function qoderRealm() {
+  return (document.querySelector('input[name="qoderRealm"]:checked') || {}).value || 'cn';
+}
+function startQoderLogin() {
+  $('qoderLoad').hidden = false; $('qoderErr').hidden = true; $('qoderDone').hidden = true;
+  api('qoder/login/start', { method: 'POST', body: JSON.stringify({ realm: qoderRealm() }) }).then(r => {
+    qoderState = r.state;
+    $('qoderUrl').textContent = r.url;
+    $('qoderLoad').hidden = true; $('qoderReady').hidden = false;
+    if (qoderTimer) clearInterval(qoderTimer);
+    qoderTimer = setInterval(pollQoderLogin, 3000);
+  }).catch(e => {
+    $('qoderLoad').hidden = true;
+    $('qoderErr').hidden = false;
+    $('qoderErr').textContent = e.message;
+  });
+}
+function stopQoderPoll() { if (qoderTimer) { clearInterval(qoderTimer); qoderTimer = null; } }
+async function pollQoderLogin() {
+  if (!qoderState) return;
+  try {
+    const r = await api('qoder/login/poll?state=' + encodeURIComponent(qoderState));
+    if (r.done) {
+      stopQoderPoll();
+      $('qoderReady').hidden = true;
+      $('qoderDone').hidden = false;
+      $('qoderDone').textContent = '已添加 ' + (r.nickname || r.uid) + '（' + (r.realm === 'global' ? '国际版' : '国内版') + '），账号已载入池中';
+      setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+    }
+  } catch (e) {
+    stopQoderPoll();
+    $('qoderReady').hidden = true;
+    $('qoderErr').hidden = false;
+    $('qoderErr').textContent = e.message + '（关闭后重新添加）';
+  }
+}
+async function importQoderPAT() {
+  const pat = $('qoderPAT').value.trim();
+  $('qoderPATErr').hidden = true;
+  if (!pat) { $('qoderPATErr').hidden = false; $('qoderPATErr').textContent = '请输入 pt- 开头的 PAT 令牌'; return; }
+  try {
+    const r = await api('qoder/pat', { method: 'POST', body: JSON.stringify({ realm: qoderRealm(), pat }) });
+    $('qoderPAT').value = '';
+    $('qoderDone').hidden = false;
+    $('qoderDone').textContent = '已添加 ' + (r.nickname || r.uid) + '（PAT，' + (r.realm === 'global' ? '国际版' : '国内版') + '）';
+    setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+  } catch (e) {
+    $('qoderPATErr').hidden = false;
+    $('qoderPATErr').textContent = e.message;
+  }
+}
+$('btnQoderPAT').onclick = importQoderPAT;
+$('btnQoderStart').onclick = startQoderLogin;
+$('btnQoderOpenUrl').onclick = () => open($('qoderUrl').textContent, '_blank');
+
 function startAddLogin() {
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;

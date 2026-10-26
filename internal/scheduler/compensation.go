@@ -91,7 +91,7 @@ func (s *Scheduler) compTargets() []compTarget {
 			out = append(out, t)
 			continue
 		}
-		if a.IsRelay() {
+		if a.IsRelay() || a.IsQoder() {
 			t.skip, t.msg = compSkipGlobal, "中转账号无补偿体系"
 			out = append(out, t)
 			continue
@@ -186,7 +186,7 @@ func (s *Scheduler) ClaimCompensationFor(uid string) (CompensationResult, error)
 	if a == nil || a.AccessTokenValue() == "" {
 		return skip(compSkipNoAuth, "无凭证")
 	}
-	if a.IsRelay() {
+	if a.IsRelay() || a.IsQoder() {
 		return skip(compSkipGlobal, "中转账号无补偿体系")
 	}
 	if a.IsGlobal() {

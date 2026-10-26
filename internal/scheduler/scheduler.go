@@ -474,6 +474,11 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		// Qoder 账号：独立签到/积分体系（sash 纯 Bearer，无 COSY），与 workbuddy 完全分叉。
+		if a.IsQoder() {
+			s.runQoderCheckin(a, st.UID)
+			continue
+		}
 		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
 		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
 		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
@@ -546,7 +551,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
-		if a.IsRelay() {
+		if a.IsRelay() || a.IsQoder() {
 			continue // 中转账号无 workbuddy 任务体系，不发起任何上游调用
 		}
 		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是
@@ -665,7 +670,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		if a == nil {
 			continue
 		}
-		if a.IsRelay() {
+		if a.IsRelay() || a.IsQoder() {
 			continue // 中转账号无 workbuddy 计费体系，不发起 get-user-resource 查询
 		}
 		wg.Add(1)

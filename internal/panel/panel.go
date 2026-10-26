@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -29,6 +30,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	qoderpkg "github.com/linguo2625469/workbuddy2api-panel/internal/upstream/qoder"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
@@ -84,6 +86,11 @@ type Panel struct {
 	loginMu sync.Mutex
 	logins  map[string]loginSession
 
+	// qoderLogins 进行中的 Qoder OAuth 设备授权会话（state → LoginSession）。
+	// 本地 device flow（不依赖 workbuddy 上游 state 端点），容量天然有界。
+	qoderLoginMu sync.Mutex
+	qoderLogins  map[string]qoderLoginSession
+
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
 	// 而不是并发跑两遍浪费上游请求（动作虽幂等，expert 系每遍含 8 次真实对话）。
@@ -137,11 +144,12 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:         cfg,
+		mux:         http.NewServeMux(),
+		started:     time.Now(),
+		logs:        NewRing(500),
+		logins:      map[string]loginSession{},
+		qoderLogins: map[string]qoderLoginSession{},
 	}
 	p.routes()
 	return p
@@ -162,6 +170,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.registerRelayRoutes()
+	p.mux.HandleFunc("POST /panel/api/qoder/login/start", p.withAuth(p.qoderLoginStart))
+	p.mux.HandleFunc("GET /panel/api/qoder/login/poll", p.withAuth(p.qoderLoginPoll))
+	p.mux.HandleFunc("POST /panel/api/qoder/pat", p.withAuth(p.qoderPATAdd))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -279,8 +290,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 
@@ -485,6 +496,94 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Qoder 账号：动态拉官方模型清单（/algo/api/v2/model/list），失败回落静态目录。
+	// 与 relay 同口径不参与双域同名去重（Qoder 模型 key 与 workbuddy 目录天然不同名）；
+	// realm 列展示 qoder / qoder_global，id 前缀与路由前缀一致（qoder:xxx 可直接点用）。
+	for _, s := range p.cfg.Pool.List() {
+		a := p.cfg.Pool.AuthByUID(s.UID)
+		if a == nil || !a.IsQoder() {
+			continue
+		}
+		hasRelay = true // 空目录时不报"没有可用账号"——Qoder 账号已算有效来源
+		entries, err := qoderpkg.NewClient(nil).FetchModels(r.Context(), qoderAccountView(a))
+		if err != nil {
+			fetchErrs = append(fetchErrs, a.Realm()+": qoder models: "+err.Error())
+		}
+		if len(entries) == 0 {
+			entries = qoderpkg.ModelsForRealm(ifQoderGlobal(a.Realm() == "qoder_global"))
+		}
+		for _, m := range entries {
+			entry := map[string]any{
+				"id":                 a.Realm() + ":" + m.Key,
+				"name":               m.DisplayName,
+				"realm":              a.Realm(),
+				"vendor":             "Qoder",
+				"relay_uid":          a.UID,
+				"is_default":         m.IsDefault,
+				"supports_images":    m.IsVL,
+				"supports_reasoning": m.IsReasoning,
+			}
+			// 积分倍率：price_factor 直接是倍率系数（0 = 定价免费）。promo_* 沿用
+			// workbuddy 口径：生效价 + 标签，前端据此显示「生效价+划线牌价」。
+			credits := formatQoderCredits(m.PriceFactor)
+			entry["credits"] = credits
+			if m.Promotion != nil && m.Promotion.DiscountFactor > 0 {
+				pf := m.Promotion.DiscountFactor
+				entry["promo_factor"] = pf
+				entry["promo_credits"] = formatQoderCredits(pf)
+				entry["promo_label"] = qoderPromoLabel(m.Promotion)
+				entry["promo_note"] = qoderPromoNote(m.Promotion)
+			} else if m.OriginalPriceFactor > 0 && m.OriginalPriceFactor != m.PriceFactor {
+				// 现价 ≠ 原价但无活动促销结构：官方基准限时价（含限时免费 0x），
+				// 牌价 = original_price_factor，标签按现价是否为 0 区分文案。
+				entry["promo_factor"] = m.PriceFactor
+				entry["promo_credits"] = credits
+				if m.PriceFactor == 0 {
+					entry["promo_label"] = "限时免费"
+					entry["credits"] = formatQoderCredits(m.OriginalPriceFactor)
+				}
+			}
+			// 思考档位：thinking_config.disabled 非空 = 可关；enabled.efforts 为档位表。
+			if m.Thinking != nil {
+				if m.Thinking.Disabled != nil {
+					entry["can_disable_thinking"] = true
+				}
+				if m.Thinking.Enabled != nil {
+					effs := make([]string, 0, len(m.Thinking.Enabled.Efforts))
+					def := ""
+					for name, e := range m.Thinking.Enabled.Efforts {
+						effs = append(effs, name)
+						if e.IsDefault {
+							def = name
+						}
+					}
+					sort.Strings(effs)
+					entry["supported_efforts"] = effs
+					if def != "" {
+						entry["default_effort"] = def
+					}
+				}
+			}
+			// 上下文窗口：context_config 取默认档 token_count；无默认取最大。
+			ctxLen := 0
+			ctxDefault := 0
+			for _, c := range m.Contexts {
+				if c.IsDefault && c.TokenCount > ctxDefault {
+					ctxDefault = c.TokenCount
+				}
+				if c.TokenCount > ctxLen {
+					ctxLen = c.TokenCount
+				}
+			}
+			if ctxDefault > 0 {
+				entry["context_length"] = ctxDefault
+			} else if ctxLen > 0 {
+				entry["context_length"] = ctxLen
+			}
+			out = append(out, entry)
+		}
+	}
+
 	if len(out) == 0 && !hasRelay {
 		if len(fetchErrs) > 0 {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
@@ -494,6 +593,64 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// qoderAccountView auth.Auth → qoder 出站账号视图（与 server.qoderAccountOf 同口径）。
+func qoderAccountView(a *auth.Auth) qoderpkg.Account {
+	return qoderpkg.Account{
+		UID:              a.UID,
+		Nickname:         a.Nickname,
+		AccessToken:      a.AccessTokenValue(),
+		RefreshToken:     a.RefreshTokenValue(),
+		UserType:         a.QoderUserType(),
+		OrganizationID:   a.OrganizationID,
+		OrganizationName: a.OrganizationName,
+		Global:           a.Realm() == "qoder_global",
+	}
+}
+
+// ifQoderGlobal bool → realm 目录名。
+func ifQoderGlobal(b bool) string {
+	if b {
+		return "global"
+	}
+	return "cn"
+}
+
+// formatQoderCredits Qoder price_factor → 前端倍率展示文案（与 workbuddy 的
+// credits 口径对齐：倍率数值）。
+func formatQoderCredits(priceFactor float64) string {
+	// 去尾零：0.5 → "0.5"，0 → "0"（0 是官方定价系数，不解读为"免费"——
+	// 是否限时免费由 promotion/original_price_factor 单独判定）
+	s := strconv.FormatFloat(priceFactor, 'f', -1, 64)
+	return s + "x"
+}
+
+// qoderPromoLabel 促销标签（badge 中文优先）。
+func qoderPromoLabel(p *qoderpkg.Promotion) string {
+	if p.Badge != nil {
+		if p.Badge.Zh != "" {
+			return p.Badge.Zh
+		}
+		return p.Badge.En
+	}
+	return "限时优惠"
+}
+
+// qoderPromoNote 促销说明（中文优先，附时段）。
+func qoderPromoNote(p *qoderpkg.Promotion) string {
+	var desc string
+	if p.Description != nil {
+		if p.Description.Zh != "" {
+			desc = p.Description.Zh
+		} else {
+			desc = p.Description.En
+		}
+	}
+	if desc == "" {
+		desc = fmt.Sprintf("折扣倍率 %.2g（%s-%s）", p.DiscountFactor, p.WindowStart, p.WindowEnd)
+	}
+	return desc
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 为裸名（与 /v1/models 合并去前缀
@@ -649,6 +806,40 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	checkinDone := false
+	// Qoder 账号：独立签到/积分体系（sash 纯 Bearer），走 qoder 包分支。
+	if a.IsQoder() {
+		realm := qoderpkg.RealmFor(func() string {
+			if a.Realm() == "qoder_global" {
+				return "global"
+			}
+			return "cn"
+		}())
+		token := a.AccessTokenValue()
+		if st, err := qoderpkg.FetchCheckinStatus(r.Context(), http.DefaultClient, realm, token); err == nil && st.Available && st.TodayCheckedIn {
+			checkinMsg = "今日已签到（连签 " + strconv.FormatInt(st.StreakDays, 10) + " 天）"
+			checkinDone = true
+			p.cfg.Pool.NoteCheckinDone(uid)
+		} else if res, err := qoderpkg.DailyCheckin(r.Context(), http.DefaultClient, realm, token); err != nil {
+			checkinMsg = err.Error()
+		} else {
+			checkinMsg = res.Message
+			checkinDone = res.OK
+			if res.OK {
+				p.cfg.Pool.NoteCheckinDone(uid)
+			}
+		}
+		resp := map[string]any{"ok": true, "checkin_done": checkinDone, "checkin_message": checkinMsg}
+		if q, err := qoderpkg.FetchQuota(r.Context(), http.DefaultClient, realm, token); err == nil {
+			p.cfg.Pool.ReenableIfCredits(uid, q.Remain, q.Size)
+			p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{Remain: q.Remain, Total: q.Size})
+			resp["credits"] = q.Remain
+			resp["credits_total"] = q.Size
+		} else {
+			resp["balance_error"] = err.Error()
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
 	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
@@ -701,7 +892,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	if a.IsRelay() {
+	if a.IsRelay() || a.IsQoder() {
 		writeErr(w, http.StatusBadRequest, "中转账号无 workbuddy 积分/余额体系，不支持余额刷新")
 		return
 	}
@@ -1045,7 +1236,7 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	rowCount := 0 // relay 账号被跳过后，实际写入 out 的行数
 	for i, s := range accts {
 		a := p.cfg.Pool.AuthByUID(s.UID)
-		if a != nil && a.IsRelay() {
+		if a != nil && (a.IsRelay() || a.IsQoder()) {
 			continue // 中转账号无 workbuddy 积分包/到期体系，不发起上游查询
 		}
 		j := rowCount

@@ -28,6 +28,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	qoderpkg "github.com/linguo2625469/workbuddy2api-panel/internal/upstream/qoder"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
@@ -331,6 +332,7 @@ func main() {
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
+		Qoder:        qoderpkg.NewClient(nil),
 		APIKey:       cfg.APIKey,
 		Session:      sessRouter,
 		StickyCount:  sessCount,

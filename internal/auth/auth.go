@@ -51,6 +51,23 @@ type Auth struct {
 
 	// Models 中转站账号的模型名单（手动拉取后落盘，面板展示/同步用；不参与网关路由校验）。
 	Models []string
+
+	// Qoder 专有（realm=qoder / qoder_global）：COSY 身份体与 token 刷新所需。
+	UserType         string // COSY 身份体 user_type；空 = DefaultUserType
+	OrganizationID   string
+	OrganizationName string
+	PersonalToken    string // PAT 账号保留 pt- 原值（job 刷新失败的兜底）；OAuth 账号为空
+	MachineID        string // 设备授权 machine_id（账号稳定设备标识）
+}
+
+// QoderUserType COSY 身份体的 user_type（缺省回 DefaultUserType）。
+func (a *Auth) QoderUserType() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.UserType == "" {
+		return "personal_professional_trial"
+	}
+	return a.UserType
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -131,6 +148,9 @@ func (a *Auth) realmLocked() string {
 	if a.realm == "relay" {
 		return "relay" // 中转站账号：独立出站路径，不受 global 逃生门影响
 	}
+	if a.realm == "qoder" || a.realm == "qoder_global" {
+		return a.realm // Qoder 上游账号：独立出站路径（COSY 签名），与 workbuddy 双域无关
+	}
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -146,6 +166,15 @@ func (a *Auth) IsRelay() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.realmLocked() == "relay"
+}
+
+// IsQoder 报告账号是否为 Qoder 上游账号（realm=qoder / qoder_global）。
+// 与 relay 同口径：无 workbuddy 任务体系，调度任务跳过，出站走 Qoder COSY 路径。
+func (a *Auth) IsQoder() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	r := a.realmLocked()
+	return r == "qoder" || r == "qoder_global"
 }
 
 // ResolveRealm 归一化 realm（cn/global）：显式非空优先，否则按原始 domain 推断
@@ -308,13 +337,19 @@ func Parse(raw []byte) (*Auth, error) {
 	if _, nested := probe["auth"]; nested {
 		var n struct {
 			Auth struct {
-				AccessToken  string `json:"accessToken"`
-				RefreshToken string `json:"refreshToken"`
-				ExpiresAt    int64  `json:"expiresAt"`
-				Domain       string `json:"domain"`
-				Realm        string `json:"realm"`
-				BaseURL      string `json:"base_url"`
+				AccessToken  string   `json:"accessToken"`
+				RefreshToken string   `json:"refreshToken"`
+				ExpiresAt    int64    `json:"expiresAt"`
+				Domain       string   `json:"domain"`
+				Realm        string   `json:"realm"`
+				BaseURL      string   `json:"base_url"`
 				Models       []string `json:"models"`
+				// Qoder 专有扩展键（realm=qoder/qoder_global 时有值；其他域忽略）
+				UserType         string `json:"user_type"`
+				OrganizationID   string `json:"organization_id"`
+				OrganizationName string `json:"organization_name"`
+				PersonalToken    string `json:"personal_token"`
+				MachineID        string `json:"machine_id"`
 			} `json:"auth"`
 			Account struct {
 				UID          string `json:"uid"`
@@ -328,47 +363,63 @@ func Parse(raw []byte) (*Auth, error) {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
 		}
 		a = Auth{
-			AccessToken:  n.Auth.AccessToken,
-			RefreshToken: n.Auth.RefreshToken,
-			ExpiresAt:    n.Auth.ExpiresAt,
-			Domain:       n.Auth.Domain,
-			realm:        n.Auth.Realm,
-			UID:          n.Account.UID,
-			EnterpriseID: n.Account.EnterpriseID,
-			Nickname:     n.Account.Nickname,
-			DeviceToken:  n.DeviceToken,
-			BaseURL:      n.Auth.BaseURL,
-			Models:       n.Auth.Models,
+			AccessToken:      n.Auth.AccessToken,
+			RefreshToken:     n.Auth.RefreshToken,
+			ExpiresAt:        n.Auth.ExpiresAt,
+			Domain:           n.Auth.Domain,
+			realm:            n.Auth.Realm,
+			UID:              n.Account.UID,
+			EnterpriseID:     n.Account.EnterpriseID,
+			Nickname:         n.Account.Nickname,
+			DeviceToken:      n.DeviceToken,
+			BaseURL:          n.Auth.BaseURL,
+			Models:           n.Auth.Models,
+			UserType:         n.Auth.UserType,
+			OrganizationID:   n.Auth.OrganizationID,
+			OrganizationName: n.Auth.OrganizationName,
+			PersonalToken:    n.Auth.PersonalToken,
+			MachineID:        n.Auth.MachineID,
 		}
 	} else {
 		var f struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresAt    int64  `json:"expiresAt"`
-			Domain       string `json:"domain"`
-			Realm        string `json:"realm"`
-			UID          string `json:"uid"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
-			DeviceToken  string `json:"device_token"`
-			BaseURL      string `json:"base_url"`
+			AccessToken  string   `json:"accessToken"`
+			RefreshToken string   `json:"refreshToken"`
+			ExpiresAt    int64    `json:"expiresAt"`
+			Domain       string   `json:"domain"`
+			Realm        string   `json:"realm"`
+			UID          string   `json:"uid"`
+			EnterpriseID string   `json:"enterpriseId"`
+			Nickname     string   `json:"nickname"`
+			DeviceToken  string   `json:"device_token"`
+			BaseURL      string   `json:"base_url"`
 			Models       []string `json:"models"`
+			// Qoder 专有扩展键
+			UserType         string `json:"user_type"`
+			OrganizationID   string `json:"organization_id"`
+			OrganizationName string `json:"organization_name"`
+			PersonalToken    string `json:"personal_token"`
+			MachineID        string `json:"machine_id"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
 		}
 		a = Auth{
-			AccessToken:  f.AccessToken,
-			RefreshToken: f.RefreshToken,
-			ExpiresAt:    f.ExpiresAt,
-			Domain:       f.Domain,
-			realm:        f.Realm,
-			UID:          f.UID,
-			EnterpriseID: f.EnterpriseID,
-			Nickname:     f.Nickname,
-			DeviceToken:  f.DeviceToken,
-			BaseURL:      f.BaseURL,
-			Models:       f.Models,
+			AccessToken:      f.AccessToken,
+			RefreshToken:     f.RefreshToken,
+			ExpiresAt:        f.ExpiresAt,
+			Domain:           f.Domain,
+			realm:            f.Realm,
+			UID:              f.UID,
+			EnterpriseID:     f.EnterpriseID,
+			Nickname:         f.Nickname,
+			DeviceToken:      f.DeviceToken,
+			BaseURL:          f.BaseURL,
+			Models:           f.Models,
+			UserType:         f.UserType,
+			OrganizationID:   f.OrganizationID,
+			OrganizationName: f.OrganizationName,
+			PersonalToken:    f.PersonalToken,
+			MachineID:        f.MachineID,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -404,6 +455,17 @@ func (a *Auth) SaveAtomic() error {
 			"enterpriseId": a.EnterpriseID,
 			"nickname":     a.Nickname,
 		},
+	}
+	// Qoder 专有键非空才写回（realm=qoder/qoder_global 的账号），其他域不引入空键。
+	if a.realm == "qoder" || a.realm == "qoder_global" {
+		am := doc["auth"].(map[string]any)
+		am["user_type"] = a.UserType
+		am["organization_id"] = a.OrganizationID
+		am["organization_name"] = a.OrganizationName
+		am["machine_id"] = a.MachineID
+		if a.PersonalToken != "" {
+			am["personal_token"] = a.PersonalToken
+		}
 	}
 	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
@@ -445,6 +507,12 @@ func LoadDir(dir string) ([]*Auth, error) {
 		return nil, err
 	}
 	files = append(files, relayFiles...)
+	// qoder-*.json：Qoder 上游账号（realm=qoder / qoder_global，COSY 签名出站）。
+	qoderFiles, err := filepath.Glob(filepath.Join(dir, "qoder-*.json"))
+	if err != nil {
+		return nil, err
+	}
+	files = append(files, qoderFiles...)
 	// seenUID 重复 UID 检测：同 UID 出现在多个文件时（双 realm 同名 UID 概率近零）
 	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
 	seenUID := make(map[string]string, len(files))

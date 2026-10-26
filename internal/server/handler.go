@@ -25,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	qoderpkg "github.com/linguo2625469/workbuddy2api-panel/internal/upstream/qoder"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
@@ -32,6 +33,8 @@ import (
 type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
+	// Qoder Qoder 上游客户端（可选；nil = Qoder realm 不可用，模型名按不可用报错）。
+	Qoder *qoderpkg.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
@@ -591,7 +594,83 @@ func (h *Handler) modelList() []map[string]any {
 			})
 		}
 	}
+	// Qoder 账号：合并 COSY 动态模型清单（失败回落静态目录），id 输出为
+	// 「qoder:模型」/「qoder_global:模型」——前缀即 chatCompletions 路由协议，
+	// 客户端复制 id 即可直接调用。与 relay 同口径不参与 cn/global 去重
+	//（Qoder 模型 key 与 workbuddy 目录天然不同名）。10min 缓存避免客户端
+	// 周期刷新持续打上游（与 fetchDynamicModels 同理）。
+	for _, s := range h.cfg.Pool.List() {
+		if s.Disabled {
+			continue
+		}
+		a := h.cfg.Pool.AuthByUID(s.UID)
+		if a == nil || !a.IsQoder() {
+			continue
+		}
+		realmName := "cn"
+		if a.Realm() == "qoder_global" {
+			realmName = "global"
+		}
+		for _, m := range h.fetchQoderModels(a) {
+			out = append(out, qoderModelEntry(a.Realm(), realmName, m))
+		}
+	}
 	return out
+}
+
+// qoderModelsCache /v1/models 的 Qoder 段缓存：10min 正缓存 + 5min 负缓存，
+// 与 fetchDynamicModels 同理——公开端点逐请求实时拉取会让客户端周期刷新
+// 持续打上游。按账号 UID 分键（cn/global 账号目录可能不同）。
+var qoderModelsCache struct {
+	sync.RWMutex
+	entries map[string]qoderModelsEntry
+}
+type qoderModelsEntry struct {
+	ids      []qoderpkg.ModelCatalogEntry
+	fetched  time.Time
+	lastFail time.Time
+}
+
+const qoderModelsTTL = 10 * time.Minute
+
+// fetchQoderModels 拉某 Qoder 账号的模型清单（缓存优先；失败回落静态目录）。
+func (h *Handler) fetchQoderModels(a *auth.Auth) []qoderpkg.ModelCatalogEntry {
+	uid := a.UID
+	qoderModelsCache.Lock()
+	if qoderModelsCache.entries == nil {
+		qoderModelsCache.entries = make(map[string]qoderModelsEntry)
+	}
+	e, ok := qoderModelsCache.entries[uid]
+	qoderModelsCache.Unlock()
+	if ok && len(e.ids) > 0 && time.Since(e.fetched) < qoderModelsTTL {
+		return e.ids
+	}
+	if ok && len(e.ids) == 0 && time.Since(e.lastFail) < modelsFetchFailCooldown {
+		return qoderpkg.ModelsForRealm(ifQoderRealmName(a.Realm()))
+	}
+	entries, err := h.cfg.Qoder.FetchModels(context.Background(), qoderAccountOf(a))
+	now := time.Now()
+	qoderModelsCache.Lock()
+	if err != nil || len(entries) == 0 {
+		qoderModelsCache.entries[uid] = qoderModelsEntry{lastFail: now}
+		log.Printf("WARN: [server] /v1/models: Qoder 模型目录拉取失败（%s 内不再重试，回落静态目录）: %v",
+			modelsFetchFailCooldown, err)
+	} else {
+		qoderModelsCache.entries[uid] = qoderModelsEntry{ids: entries, fetched: now}
+	}
+	qoderModelsCache.Unlock()
+	if err != nil || len(entries) == 0 {
+		return qoderpkg.ModelsForRealm(ifQoderRealmName(a.Realm()))
+	}
+	return entries
+}
+
+// ifQoderRealmName auth realm（"qoder"/"qoder_global"）→ 目录名。
+func ifQoderRealmName(realm string) string {
+	if realm == "qoder_global" {
+		return "global"
+	}
+	return "cn"
 }
 
 // fetchGlobalModels 返回 global 模型名单（纯动态探测结果）及被探测账号。
@@ -753,6 +832,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 不走 workbuddy 协议翻译、不刷新 token。
 	if realm == "relay" {
 		st.status = h.relayChat(w, r, body, tried, st, "", bareModel)
+		return
+	}
+	// Qoder 分支：qoder: / qoder_global: 前缀点名（或裸名池中只有 Qoder 账号）。
+	// OpenAI 兼容入站 → COSY 签名出站 → SSE 信封解包回标准 OpenAI SSE。
+	if realm == "qoder" || realm == "qoder_global" {
+		st.status = h.qoderChat(w, r, body, tried, st, bareModel, realm)
 		return
 	}
 	if realmExplicit && realm != "cn" && realm != "global" {

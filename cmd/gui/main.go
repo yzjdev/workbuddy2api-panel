@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -251,7 +252,46 @@ func (c *controller) running() bool {
 	return c.externalAlive()
 }
 
+// killPrevInstances 结束本映像名的其它 GUI 实例（双击再启动时先关掉上一个窗口）。
+// 旧实例退出时其 Job Object 会连带停掉它启动的网关，由新实例接管。
+// 不能直接 taskkill /IM —— 那会把新实例自己也杀掉，故先按 PID 过滤。
+func killPrevInstances() {
+	self := os.Getpid()
+	cmd := exec.Command("tasklist", "/FI", fmt.Sprintf("IMAGENAME eq %s", filepath.Base(selfExe())), "/NH")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[1])
+		if err != nil || pid == self {
+			continue
+		}
+		kill := exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/F")
+		kill.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+		_ = kill.Run()
+	}
+	// 给旧实例一点退出时间（其网关随之退出、端口释放）。
+	time.Sleep(500 * time.Millisecond)
+}
+
+// selfExe 返回当前可执行文件完整路径；取不到时返回空串。
+func selfExe() string {
+	p, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
 func main() {
+	// 双击再启动：先关掉上一个 GUI 实例（其网关随 Job Object 退出，由本实例接管）。
+	killPrevInstances()
 	dir, _ := os.Getwd()
 	if exe, err := os.Executable(); err == nil {
 		dir = filepath.Dir(exe)

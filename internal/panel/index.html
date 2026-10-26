@@ -794,6 +794,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="cn">国内版 CN</option>
             <option value="global">国际版 Global</option>
             <option value="relay">中转 Relay</option>
+            <option value="qoder">Qoder 国内</option>
+            <option value="qoder_global">Qoder 国际</option>
           </select>
           <select id="mdCap" aria-label="按能力筛选">
             <option value="">全部能力</option>
@@ -1354,6 +1356,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="tabs" id="addTabs">
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
+        <button class="tab" data-tab="qoder">Qoder 账号</button>
       </div>
     </header>
     <div class="body">
@@ -1382,6 +1385,35 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <input type="file" id="importFile" accept=".json" style="margin-bottom:8px">
         <div id="importDone" class="state ok" hidden></div>
         <div id="importErr" class="state err" hidden></div>
+      </div>
+      <!-- Qoder 账号 -->
+      <div id="addTabQoder" class="tab-panel" hidden>
+        <div class="realm-row">
+          <span class="hint" style="font-size:12px">区域：</span>
+          <label class="realm-opt"><input type="radio" name="qoderRealm" value="cn" checked> 国内版（qoder.com.cn）</label>
+          <label class="realm-opt"><input type="radio" name="qoderRealm" value="global"> 国际版（qoder.com）</label>
+        </div>
+        <div id="qoderOAuthBox">
+          <div class="hint" style="font-size:12px;margin-bottom:6px">OAuth 设备授权：点击下方按钮获取授权链接，在浏览器完成登录后本页自动检测。</div>
+          <div style="margin-bottom:8px"><button class="primary" id="btnQoderStart">获取授权链接</button></div>
+          <div id="qoderLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
+          <div id="qoderReady" hidden>
+            <div class="state">在浏览器打开以下链接并登录 Qoder 账号：</div>
+            <div class="url" id="qoderUrl"></div>
+            <div style="margin-top:6px"><button id="btnQoderOpenUrl">在浏览器打开</button></div>
+            <div class="state"><span class="dots">等待授权完成，自动检测中</span></div>
+          </div>
+          <div id="qoderDone" class="state ok" hidden></div>
+          <div id="qoderErr" class="state err" hidden></div>
+        </div>
+        <div style="border-top:1px solid var(--line-soft);margin:12px 0;padding-top:10px">
+          <div class="hint" style="font-size:12px;margin-bottom:6px">或使用 PAT 令牌导入（pt- 开头，Qoder 设置页可生成）：</div>
+          <div style="display:flex;gap:8px">
+            <input type="text" id="qoderPAT" placeholder="pt-..." style="flex:1">
+            <button id="btnQoderPAT">导入 PAT</button>
+          </div>
+          <div id="qoderPATErr" class="state err" hidden></div>
+        </div>
       </div>
     </div>
     <footer>
