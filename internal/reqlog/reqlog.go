@@ -78,6 +78,9 @@ type Event struct {
 	TotalTokens      int64     `json:"total_tokens,omitempty"`
 	Credit           float64   `json:"credit,omitempty"`
 	HasCredit        bool      `json:"credit_known"`
+	// Rate 该模型的计费倍率文案（如 "x0.08"）。上游不回单次积分的域（TRAE 等）
+	// 用它标注计费口径；空 = 未知/不适用。
+	Rate string `json:"rate,omitempty"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`

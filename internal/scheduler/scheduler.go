@@ -479,6 +479,11 @@ func (s *Scheduler) RunCheckinNow() {
 			s.runQoderCheckin(a, st.UID)
 			continue
 		}
+		// TRAE 账号：独立签到体系（UG 接口，Cloud-IDE-JWT），同样与 workbuddy 分叉。
+		if a.IsTrae() {
+			s.runTraeCheckin(a, st.UID)
+			continue
+		}
 		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
 		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
 		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
@@ -551,7 +556,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
-		if a.IsRelay() || a.IsQoder() {
+		if a.IsUpstreamOnly() {
 			continue // 中转账号无 workbuddy 任务体系，不发起任何上游调用
 		}
 		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是
@@ -670,8 +675,17 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		if a == nil {
 			continue
 		}
-		if a.IsRelay() || a.IsQoder() {
-			continue // 中转账号无 workbuddy 计费体系，不发起 get-user-resource 查询
+		if a.IsUpstreamOnly() && !a.IsTrae() {
+			continue // 中转/Qoder 账号无 workbuddy 计费体系，不发起 get-user-resource 查询
+		}
+		// TRAE 账号有独立积分接口（ide_user_ent_usage），单独走一条刷新路径。
+		if a.IsTrae() {
+			wg.Add(1)
+			go func(a *auth.Auth, uid string) {
+				defer wg.Done()
+				s.refreshTraeCredits(a, uid)
+			}(a, st.UID)
+			continue
 		}
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {

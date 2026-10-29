@@ -26,6 +26,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	qoderpkg "github.com/linguo2625469/workbuddy2api-panel/internal/upstream/qoder"
+	traepkg "github.com/linguo2625469/workbuddy2api-panel/internal/upstream/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
@@ -35,6 +36,8 @@ type Config struct {
 	Upstream  *upstream.Client
 	// Qoder Qoder 上游客户端（可选；nil = Qoder realm 不可用，模型名按不可用报错）。
 	Qoder *qoderpkg.Client
+	// Trae TRAE 上游客户端（可选；nil = trae realm 不可用）。
+	Trae *traepkg.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
@@ -152,6 +155,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
+		// TRAE 授权登录的回调路径固定为 /authorize（官方客户端形态），落在根路径上，
+		// 不在 /panel/ 前缀内 —— 故单独转发给面板 handler。这样回调可以直接复用
+		// API 端口，不必额外监听 18080。
+		h.mux.Handle("/authorize", cfg.Panel)
 	}
 	return h
 }
@@ -256,11 +263,17 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"cooling":        cooling,
 		"disabled":       disabled,
 		"in_flight_full": inFlightFull,
-		// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
+		// realm_totals 按域分组的计数汇总（多域并存时运维一眼看到各域可用性）：
 		// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
+		// 除 workbuddy 双域外，也列出独立上游域（qoder/relay/trae）——它们各自选号、
+		// 各自冷却，混在 cn/global 里看不出来。
 		"realm_totals": map[string]map[string]int{
-			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
-			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
+			"cn":            countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
+			"global":        countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
+			"qoder":         countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("qoder")),
+			"qoder_global":  countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("qoder_global")),
+			"relay":         countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("relay")),
+			"trae":          countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("trae")),
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
@@ -615,6 +628,21 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, qoderModelEntry(a.Realm(), realmName, m))
 		}
 	}
+	// TRAE 账号：合并 SOLO 目录（失败回落静态兜底目录），id 输出为「trae:展示名」。
+	// 与 Qoder 同口径：前缀即路由协议、不参与 cn/global 去重、按账号 UID 缓存。
+	// ⚠️ 目录里的每条条目都带着「所属通道」，出站时按模型路由通道（发错会流内 4001）。
+	for _, s := range h.cfg.Pool.List() {
+		if s.Disabled {
+			continue
+		}
+		a := h.cfg.Pool.AuthByUID(s.UID)
+		if a == nil || !a.IsTrae() {
+			continue
+		}
+		for _, m := range h.fetchTraeModels(a) {
+			out = append(out, traeModelEntry(m))
+		}
+	}
 	return out
 }
 
@@ -808,6 +836,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+		// ⚠️ requestID 必须一起转交：流水行的 rid/out/try/credit 扩展段以它为前提，
+		// 漏了这一步会让「积分消耗」永远打不出来（本次修复的真实缺陷）。
+		st.requestID = tr.id
 	}
 	defer st.done()
 
@@ -838,6 +869,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// OpenAI 兼容入站 → COSY 签名出站 → SSE 信封解包回标准 OpenAI SSE。
 	if realm == "qoder" || realm == "qoder_global" {
 		st.status = h.qoderChat(w, r, body, tried, st, bareModel, realm)
+		return
+	}
+	// TRAE 分支：trae: 前缀点名。OpenAI 入站 → SOLO 协议出站 → 事件流翻回 OpenAI SSE。
+	if realm == "trae" {
+		st.status = h.traeChat(w, r, body, tried, st, stripModelPrefix(bareModel, "trae"))
 		return
 	}
 	if realmExplicit && realm != "cn" && realm != "global" {

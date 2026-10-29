@@ -58,6 +58,22 @@ type Auth struct {
 	OrganizationName string
 	PersonalToken    string // PAT 账号保留 pt- 原值（job 刷新失败的兜底）；OAuth 账号为空
 	MachineID        string // 设备授权 machine_id（账号稳定设备标识）
+
+	// DeviceID 设备号（realm=trae 的 device_id，hex32，与 machine_id 同格式）。
+	// 每个账号必须互不相同：TRAE 签到缺它会报 9004。
+	DeviceID string
+	// APIHost TRAE 账号的 OAuth 基址覆盖（auth 文件 apiHost 键，缺省 api.trae.com.cn）。
+	APIHost string
+}
+
+// firstNonEmpty 返回第一个非空串（解析层 camelCase / snake_case 兼容用）。
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // QoderUserType COSY 身份体的 user_type（缺省回 DefaultUserType）。
@@ -151,6 +167,9 @@ func (a *Auth) realmLocked() string {
 	if a.realm == "qoder" || a.realm == "qoder_global" {
 		return a.realm // Qoder 上游账号：独立出站路径（COSY 签名），与 workbuddy 双域无关
 	}
+	if a.realm == "trae" {
+		return a.realm // TRAE 上游账号：独立出站路径（SOLO 协议）
+	}
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -175,6 +194,27 @@ func (a *Auth) IsQoder() bool {
 	defer a.mu.Unlock()
 	r := a.realmLocked()
 	return r == "qoder" || r == "qoder_global"
+}
+
+// IsTrae 报告账号是否为 TRAE 上游账号（realm=trae）。
+// 与 relay/Qoder 同口径：无 workbuddy 任务体系（签到走 TRAE 自己的 UG 接口），
+// 出站走 SOLO 协议。
+func (a *Auth) IsTrae() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realmLocked() == "trae"
+}
+
+// IsUpstreamOnly 报告账号是否属于「独立上游域」（relay / qoder / trae）：
+// 这类账号没有 workbuddy 的签到/旅行/活跃/黑猫/补偿/余额体系，调度任务必须跳过。
+func (a *Auth) IsUpstreamOnly() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch a.realmLocked() {
+	case "relay", "qoder", "qoder_global", "trae":
+		return true
+	}
+	return false
 }
 
 // ResolveRealm 归一化 realm（cn/global）：显式非空优先，否则按原始 domain 推断
@@ -350,6 +390,12 @@ func Parse(raw []byte) (*Auth, error) {
 				OrganizationName string `json:"organization_name"`
 				PersonalToken    string `json:"personal_token"`
 				MachineID        string `json:"machine_id"`
+				// TRAE 扩展键：参考实现用 camelCase（machineId/deviceId/apiHost），
+				// 本项目的 snake_case 也兼容（两者都有时 camelCase 优先）。
+				DeviceID       string `json:"device_id"`
+				DeviceIDCamel  string `json:"deviceId"`
+				MachineIDCamel string `json:"machineId"`
+				APIHost        string `json:"apiHost"`
 			} `json:"auth"`
 			Account struct {
 				UID          string `json:"uid"`
@@ -378,7 +424,9 @@ func Parse(raw []byte) (*Auth, error) {
 			OrganizationID:   n.Auth.OrganizationID,
 			OrganizationName: n.Auth.OrganizationName,
 			PersonalToken:    n.Auth.PersonalToken,
-			MachineID:        n.Auth.MachineID,
+			MachineID:        firstNonEmpty(n.Auth.MachineIDCamel, n.Auth.MachineID),
+			DeviceID:         firstNonEmpty(n.Auth.DeviceIDCamel, n.Auth.DeviceID),
+			APIHost:          n.Auth.APIHost,
 		}
 	} else {
 		var f struct {
@@ -399,6 +447,11 @@ func Parse(raw []byte) (*Auth, error) {
 			OrganizationName string `json:"organization_name"`
 			PersonalToken    string `json:"personal_token"`
 			MachineID        string `json:"machine_id"`
+			// TRAE 扩展键（camelCase 优先，snake_case 兼容）
+			DeviceID       string `json:"device_id"`
+			DeviceIDCamel  string `json:"deviceId"`
+			MachineIDCamel string `json:"machineId"`
+			APIHost        string `json:"apiHost"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -419,7 +472,9 @@ func Parse(raw []byte) (*Auth, error) {
 			OrganizationID:   f.OrganizationID,
 			OrganizationName: f.OrganizationName,
 			PersonalToken:    f.PersonalToken,
-			MachineID:        f.MachineID,
+			MachineID:        firstNonEmpty(f.MachineIDCamel, f.MachineID),
+			DeviceID:         firstNonEmpty(f.DeviceIDCamel, f.DeviceID),
+			APIHost:          f.APIHost,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -465,6 +520,20 @@ func (a *Auth) SaveAtomic() error {
 		am["machine_id"] = a.MachineID
 		if a.PersonalToken != "" {
 			am["personal_token"] = a.PersonalToken
+		}
+	}
+	// TRAE 扩展键：device_id / machine_id 必须持久化（签到缺 device_id 报 9004），
+	// 键名用参考实现的 camelCase，便于与 trae2api-web 的 auth 文件互通。
+	if a.realm == "trae" {
+		am := doc["auth"].(map[string]any)
+		if a.MachineID != "" {
+			am["machineId"] = a.MachineID
+		}
+		if a.DeviceID != "" {
+			am["deviceId"] = a.DeviceID
+		}
+		if a.APIHost != "" {
+			am["apiHost"] = a.APIHost
 		}
 	}
 	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
@@ -513,6 +582,12 @@ func LoadDir(dir string) ([]*Auth, error) {
 		return nil, err
 	}
 	files = append(files, qoderFiles...)
+	// trae-*.json：TRAE 上游账号（realm=trae，SOLO 协议）。
+	traeFiles, err := filepath.Glob(filepath.Join(dir, "trae-*.json"))
+	if err != nil {
+		return nil, err
+	}
+	files = append(files, traeFiles...)
 	// seenUID 重复 UID 检测：同 UID 出现在多个文件时（双 realm 同名 UID 概率近零）
 	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
 	seenUID := make(map[string]string, len(files))

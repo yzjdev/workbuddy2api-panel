@@ -796,6 +796,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="relay">中转 Relay</option>
             <option value="qoder">Qoder 国内</option>
             <option value="qoder_global">Qoder 国际</option>
+            <option value="trae">TRAE</option>
           </select>
           <select id="mdCap" aria-label="按能力筛选">
             <option value="">全部能力</option>
@@ -1357,6 +1358,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
         <button class="tab" data-tab="qoder">Qoder 账号</button>
+        <button class="tab" data-tab="trae">TRAE 账号</button>
       </div>
     </header>
     <div class="body">
@@ -1414,6 +1416,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
           <div id="qoderPATErr" class="state err" hidden></div>
         </div>
+      </div>
+      <!-- TRAE 账号（生成授权链接 → 浏览器登录 → 本地回调自动回填；18080 不可用时粘贴兜底） -->
+      <div id="addTabTrae" class="tab-panel" hidden>
+        <div class="hint" style="font-size:12px;margin-bottom:8px">点击下方按钮生成 TRAE 授权链接，在浏览器用手机号登录后本页自动检测并添加账号。</div>
+        <div style="margin-bottom:8px"><button class="primary" id="btnTraeStart">获取授权链接</button></div>
+        <div id="traeLoad" class="state" hidden><span class="dots">正在生成授权链接</span></div>
+        <div id="traeReady" hidden>
+          <div class="state">在浏览器打开以下链接并登录 TRAE 账号：</div>
+          <div class="url" id="traeUrl"></div>
+          <div style="margin-top:6px"><button id="btnTraeOpenUrl">在浏览器打开</button></div>
+          <div id="traeAutoWait" class="state"><span class="dots">等待授权完成，自动检测中</span></div>
+          <div id="traePasteBox" hidden>
+            <div class="state" style="margin-top:8px">登录成功后浏览器会跳到打不开的 127.0.0.1 页面：复制地址栏的**完整链接**粘贴到下面即可完成添加。</div>
+            <textarea id="traePasteUrl" rows="3" placeholder="http://127.0.0.1:18080/authorize?refreshToken=..." style="width:100%;margin-top:6px;font-family:monospace;font-size:12px"></textarea>
+            <div style="margin-top:6px"><button class="primary" id="btnTraePaste">粘贴并完成登录</button></div>
+          </div>
+        </div>
+        <div id="traeDone" class="state ok" hidden></div>
+        <div id="traeErr" class="state err" hidden></div>
       </div>
     </div>
     <footer>

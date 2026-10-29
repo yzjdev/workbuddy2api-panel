@@ -56,7 +56,7 @@ func (s *Scheduler) RunTravelNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if a.IsRelay() || a.IsQoder() {
+		if a.IsUpstreamOnly() {
 			continue // 中转账号无 workbuddy 任务体系，不发起任何上游调用
 		}
 		if a.IsGlobal() {

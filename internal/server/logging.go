@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,10 @@ type chatStat struct {
 	attempts         int
 	credit           float64
 	hasCredit        bool
+	// rateLabel 该模型在上游目录里的**计费倍率**（如 "x0.08"）。
+	// 用途：TRAE/Qoder 这类上游不回单次积分的域，用倍率标注「按什么倍率计费」，
+	// 而不是编造一个消耗数字。空 = 未知/不适用。
+	rateLabel string
 	promptTokens     int64
 	completionTokens int64
 	totalTokens      int64
@@ -90,7 +95,7 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.rateLabel, s.clientIP, s.userAgent)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -475,6 +480,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.TotalTokens = s.totalTokens
 		e.Credit = s.credit
 		e.HasCredit = s.hasCredit
+		e.Rate = s.rateLabel
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
 	}
@@ -542,13 +548,26 @@ const (
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "", "")
 }
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
+// trimFixed4 积分格式化：最多 4 位小数并去掉尾零（1.2340 → "1.234"、0.5 → "0.5"）。
+//
+// 用最短形态而不是固定 %.4f：流水行是给人扫的，1.0000 与 1 语义相同但更占宽度。
+func trimFixed4(v float64) string {
+	s := strconv.FormatFloat(v, 'f', 4, 64)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	if s == "" || s == "-" {
+		return "0"
+	}
+	return s
+}
+
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
-	requestID, outcome string, attempts int, credit float64, hasCredit bool,
+	requestID, outcome string, attempts int, credit float64, hasCredit bool, rateLabel string,
 	clientIP, userAgent string) {
 	if !chatLogEnabled {
 		return
@@ -574,7 +593,19 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
+	// 扩展段：rid/out/try 以 requestID 为前提（旧行格式零回归），但 **credit 独立**——
+	// 上游回了积分就必须打出来，不能因为缺请求 ID 就把成本信息一起丢掉。
 	extra := ""
+	creditField := "-"
+	if hasCredit {
+		creditField = trimFixed4(credit)
+	}
+	// 倍率段：上游不回单次积分的域（TRAE 等）用它标注「按什么倍率计费」。
+	// 与 credit 同理独立于 requestID —— 成本口径不能因为缺请求 ID 就丢。
+	rateField := ""
+	if rateLabel != "" {
+		rateField = " rate=" + rateLabel + " |"
+	}
 	if requestID != "" {
 		if outcome == "" {
 			outcome = reqlog.OutcomeHTTPError
@@ -582,11 +613,9 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 				outcome = reqlog.OutcomeSuccess
 			}
 		}
-		creditField := "-"
-		if hasCredit {
-			creditField = fmt.Sprintf("%.4f", credit)
-		}
-		extra = fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |", requestID, outcome, attempts, creditField)
+		extra = fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |%s", requestID, outcome, attempts, creditField, rateField)
+	} else if hasCredit || rateLabel != "" {
+		extra = fmt.Sprintf(" credit=%s |%s", creditField, rateField)
 	}
 	// 调用来源：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的客户端标签
 	// 并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只会取到 OpenAI/Python）。

@@ -436,7 +436,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.realm === 'qoder' ? ' <span class="realm-tag">Qoder 国内</span>' : '') + (s.realm === 'qoder_global' ? ' <span class="realm-tag">Qoder 国际</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.realm === 'qoder' ? ' <span class="realm-tag">Qoder 国内</span>' : '') + (s.realm === 'qoder_global' ? ' <span class="realm-tag">Qoder 国际</span>' : '') + (s.realm === 'trae' ? ' <span class="realm-tag">TRAE</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -455,7 +455,7 @@ function renderAccounts(list) {
         (s.enterprise ? '' :
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
-        (s.enterprise ? '' :
+        (s.enterprise || s.realm === 'trae' ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
@@ -738,17 +738,22 @@ function mdSortList(list, f) {
 // 避免把“上游列出了模型”误当成“当前账号有权限”。
 function mdAvailabilityOf(m, locks, recent) {
   const id = String((m && m.id) || '');
-  if (!id.startsWith('global:')) return null;
+  // 域前缀即路由协议：global: / trae: 都参与「模型锁 + 近期请求」可用性判定。
+  // 其余域（cn 裸名、relay 昵称前缀、qoder:）暂不套用这套判据。
+  const colon = id.indexOf(':');
+  const realm = colon > 0 ? id.slice(0, colon) : '';
+  if (realm !== 'global' && realm !== 'trae') return null;
+  const realmLabel = realm === 'trae' ? 'TRAE' : 'global';
   locks = Array.isArray(locks) ? locks : mdLocks;
   recent = Array.isArray(recent) ? recent : mdRecent;
-  const bare = id.slice('global:'.length);
-  const lock = locks.find(r => r && r.realm === 'global' && r.model === bare);
+  const bare = id.slice(realm.length + 1);
+  const lock = locks.find(r => r && r.realm === realm && r.model === bare);
   if (lock) {
     const reason = String(lock.reason || '').trim();
     const lower = reason.toLowerCase();
     if (lock.state === 'partial') {
       return { key: 'partial', label: '部分可用', cls: 'warn',
-        tip: '仍有 ' + Number(lock.servable || 0) + ' 个 global 账号可服务；已锁 ' + Number(lock.locked || 0) + ' 个' + (reason ? '；' + reason : '') };
+        tip: '仍有 ' + Number(lock.servable || 0) + ' 个 ' + realmLabel + ' 账号可服务；已锁 ' + Number(lock.locked || 0) + ' 个' + (reason ? '；' + reason : '') };
     }
     if (lock.state === 'starved') {
       return { key: 'starved', label: '账号暂不可用', cls: 'mute',
@@ -756,7 +761,7 @@ function mdAvailabilityOf(m, locks, recent) {
     }
     if (lower.startsWith('11158') || lower.includes('not allowed for user type')) {
       return { key: 'denied', label: '无权限', cls: 'bad',
-        tip: '当前 global 账号类型不支持该模型' + (reason ? '；' + reason : '') };
+        tip: '当前 ' + realmLabel + ' 账号类型不支持该模型' + (reason ? '；' + reason : '') };
     }
     if (lower.startsWith('11102') || lower.includes('service info not found')) {
       return { key: 'missing', label: '上游无此模型', cls: 'bad',
@@ -765,7 +770,18 @@ function mdAvailabilityOf(m, locks, recent) {
     return { key: 'limited', label: '限流/不可用', cls: 'warn',
       tip: '模型级冷却中' + (reason ? '；' + reason : '') };
   }
-  const ev = recent.find(e => e && e.model === id);
+  // 近期请求匹配要放宽：客户端可能照展示名（GLM-5.2）或 config_name（glm-5.2）
+  // 调用，大小写也不一定与目录一致；任一等价形式命中都算「有真实证据」。
+  const idLower = id.toLowerCase();
+  const bareLower = bare.toLowerCase();
+  const nameLower = String((m && m.name) || '').toLowerCase();
+  const realmPrefixedName = realm + ':' + nameLower;
+  const ev = recent.find(e => {
+    const em = String((e && e.model) || '').toLowerCase();
+    if (!em) return false;
+    return em === idLower || em === bareLower
+      || (nameLower !== '' && (em === nameLower || em === realmPrefixedName));
+  });
   if (ev) {
     const status = Number(ev.status || 0);
     const when = ev.time ? new Date(ev.time).toLocaleString('zh-CN', { hour12: false }) : '';
@@ -784,8 +800,8 @@ function mdAvailabilityOf(m, locks, recent) {
     return { key: 'failed', label: '最近失败', cls: 'bad',
       tip: '最近一次请求失败 HTTP ' + (status || '—') + (when ? ' · ' + when : '') };
   }
-  return { key: 'unknown', label: '待验证', cls: 'mute',
-    tip: '尚无模型锁或近期真实请求记录；目录存在不代表当前账号有权限' };
+  return { key: 'unknown', label: '未验证', cls: 'mute',
+    tip: '网关尚无该模型的锁记录或近期请求记录 —— 这不代表模型不可用，直接调用一次即可验证（点用即测）' };
 }
 
 function mdAvailabilityTag(m) {
@@ -809,7 +825,8 @@ function mdRowHtml(m, pr) {
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const realmTag = (m.realm === 'relay' && m.vendor) ? ' <span class="realm-tag">' + esc(m.vendor) + '</span>'
     : (m.realm === 'qoder' ? ' <span class="realm-tag">Qoder 国内</span>'
-    : (m.realm === 'qoder_global' ? ' <span class="realm-tag">Qoder 国际</span>' : ''));
+    : (m.realm === 'qoder_global' ? ' <span class="realm-tag">Qoder 国际</span>'
+    : (m.realm === 'trae' ? ' <span class="realm-tag">TRAE</span>' : '')));
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
   return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + realmTag + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
@@ -1128,9 +1145,16 @@ function reqTokenCell(e) {
 }
 
 function reqCreditCell(e) {
-  if (!e || !e.credit_known) return '<span class="muted">—</span>';
-  const v = Number(e.credit);
-  return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
+  if (!e) return '<span class="muted">—</span>';
+  if (e.credit_known) {
+    const v = Number(e.credit);
+    if (Number.isFinite(v)) return trimFixed(v.toFixed(2));
+  }
+  // 上游不回单次积分的域（TRAE 等）：展示计费倍率而不是编造消耗量。
+  if (e.rate) {
+    return '<span class="muted" title="上游未回传单次积分；该模型计费倍率 ' + esc(e.rate) + '">' + esc(e.rate) + '</span>';
+  }
+  return '<span class="muted">—</span>';
 }
 
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
@@ -1405,6 +1429,7 @@ function switchAddTab(tab) {
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
   $('addTabQoder').hidden = tab !== 'qoder';
+  $('addTabTrae').hidden = tab !== 'trae';
   // 主 footer 按钮仅属于浏览器登录 tab；qoder tab 自带按钮
   $('btnStartLogin').hidden = tab !== 'login' || $('btnStartLogin').dataset.done === '1';
   $('btnCopyUrl').hidden = tab !== 'login';
@@ -1471,6 +1496,76 @@ $('btnQoderPAT').onclick = importQoderPAT;
 $('btnQoderStart').onclick = startQoderLogin;
 $('btnQoderOpenUrl').onclick = () => open($('qoderUrl').textContent, '_blank');
 
+// ---- TRAE 添加账号（生成授权链接 → 浏览器登录 → 本地回调自动回填 / 粘贴兜底）----
+// 参考实现 trae2api-web 的口径：回调固定打 127.0.0.1:18080/authorize。
+// 本地 18080 在听 → 浏览器跳回即自动完成；不可用时前端给出粘贴框，由后端解析回调链接。
+let traeState = null, traeTimer = null;
+function stopTraePoll() { if (traeTimer) { clearInterval(traeTimer); traeTimer = null; } }
+async function pollTraeLogin() {
+  if (!traeState) return;
+  try {
+    const r = await api('trae/login/poll?state=' + encodeURIComponent(traeState));
+    if (!r.done) return;
+    stopTraePoll();
+    $('traeReady').hidden = true;
+    $('traeDone').hidden = false;
+    $('traeDone').textContent = '已添加 ' + (r.nickname || r.uid) + '，账号已载入池中';
+    setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+  } catch (e) {
+    stopTraePoll();
+    $('traeReady').hidden = true;
+    $('traeErr').hidden = false;
+    $('traeErr').textContent = e.message + '（关闭后重新添加）';
+  }
+}
+async function startTraeLogin() {
+  stopTraePoll();
+  $('traeLoad').hidden = false; $('traeErr').hidden = true; $('traeDone').hidden = true;
+  $('traeReady').hidden = true; $('traePasteBox').hidden = true;
+  try {
+    const r = await api('trae/login/start', { method: 'POST', body: JSON.stringify({}) });
+    traeState = r.state;
+    $('traeUrl').textContent = r.url;
+    $('traeLoad').hidden = true;
+    $('traeReady').hidden = false;
+    // 18080 不可用 → 只能粘贴回调链接（参考实现的 login.sh 路径）
+    $('traeAutoWait').hidden = !r.callback_ready;
+    $('traePasteBox').hidden = !!r.callback_ready;
+    traeTimer = setInterval(pollTraeLogin, 3000);
+  } catch (e) {
+    $('traeLoad').hidden = true;
+    $('traeErr').hidden = false;
+    $('traeErr').textContent = e.message;
+  }
+}
+async function pasteTraeCallback() {
+  const url = $('traePasteUrl').value.trim();
+  $('traeErr').hidden = true;
+  if (!traeState) { $('traeErr').hidden = false; $('traeErr').textContent = '请先获取授权链接'; return; }
+  if (!url) { $('traeErr').hidden = false; $('traeErr').textContent = '请粘贴浏览器地址栏里的完整回调链接'; return; }
+  $('btnTraePaste').disabled = true;
+  try {
+    const r = await api('trae/login/paste', {
+      method: 'POST',
+      body: JSON.stringify({ state: traeState, callback_url: url }),
+    });
+    stopTraePoll();
+    $('traePasteUrl').value = '';
+    $('traeReady').hidden = true;
+    $('traeDone').hidden = false;
+    $('traeDone').textContent = '已添加 ' + (r.nickname || r.uid) + '，账号已载入池中';
+    setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+  } catch (e) {
+    $('traeErr').hidden = false;
+    $('traeErr').textContent = e.message;
+  } finally {
+    $('btnTraePaste').disabled = false;
+  }
+}
+$('btnTraeStart').onclick = startTraeLogin;
+$('btnTraePaste').onclick = pasteTraeCallback;
+$('btnTraeOpenUrl').onclick = () => open($('traeUrl').textContent, '_blank');
+
 function startAddLogin() {
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
@@ -1509,7 +1604,12 @@ async function pollLogin() {
     $('addErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() {
+  stopPoll();
+  // TRAE 登录轮询同属本弹窗：关闭即停，否则会在后台持续打面板接口。
+  stopTraePoll();
+  loginState = null; $('addVeil').classList.remove('on');
+}
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');

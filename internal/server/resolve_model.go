@@ -32,6 +32,19 @@ func resolveModel(model string) (realm, bare string) {
 	return realm, bare
 }
 
+// stripModelPrefix 剥掉指定前缀（如 "trae:"）返回裸模型名。
+//
+// resolveModelDetail 对未知前缀**刻意不剥离**（保留整串供中转站昵称二次匹配），
+// 故按域直通的分支（trae）必须自己剥：上游只认裸模型名，
+// 带前缀会被当成模型不存在（trae 报 4023）。
+func stripModelPrefix(model, prefix string) string {
+	head := prefix + ":"
+	if strings.HasPrefix(model, head) {
+		return model[len(head):]
+	}
+	return model
+}
+
 // ResolveModel 是 resolveModel 的导出面（跨包调用）。
 func ResolveModel(model string) (realm, bare string) { return resolveModel(model) }
 

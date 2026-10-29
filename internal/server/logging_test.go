@@ -327,9 +327,9 @@ func TestLogChatRowExtendedFields(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
-			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "")
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 2, 1.25, true, "", "", "")
 	})
-	for _, want := range []string{"rid=req-abc123", "out=success", "try=2", "credit=1.2500"} {
+	for _, want := range []string{"rid=req-abc123", "out=success", "try=2", "credit=1.25"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("extended row missing %q:\n%s", want, out)
 		}
@@ -345,7 +345,7 @@ func TestLogChatRowSourceFields(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
 		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u123456789", "示例号",
-			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false,
+			http.StatusOK, 42, "req-abc123", reqlog.OutcomeSuccess, 1, 0, false, "",
 			"203.0.113.7", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	})
 	for _, want := range []string{`src=203.0.113.7`, `ua="Chrome/120.0.0.0"`} {
@@ -482,5 +482,36 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// 积分必须独立于 requestID 打印：早期整段扩展字段以 requestID 为前提，
+// 缺请求 ID 时连「本次扣了多少积分」一起丢掉（真实缺陷）。
+func TestLogChatRowCreditWithoutRequestID(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRowEx(10*time.Millisecond, 2*time.Second, "glm-5.3", "stream", "u1", "号",
+			http.StatusOK, 42, "", "", 1, 1.25, true, "", "", "")
+	})
+	if !strings.Contains(out, "credit=1.25") {
+		t.Errorf("缺 requestID 时也必须打印积分:\n%s", out)
+	}
+	if strings.Contains(out, "rid=") {
+		t.Errorf("无 requestID 时不应出现 rid 段:\n%s", out)
+	}
+}
+
+// 上游不回单次积分的域（TRAE）用倍率标注成本口径。
+func TestLogChatRowRateLabel(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRowEx(10*time.Millisecond, 2*time.Second, "trae:glm-5.2", "stream", "u1", "号",
+			http.StatusOK, 42, "", "", 1, 0, false, "x0.08", "", "")
+	})
+	if !strings.Contains(out, "rate=x0.08") {
+		t.Errorf("应打印计费倍率:\n%s", out)
+	}
+	if !strings.Contains(out, "credit=-") {
+		t.Errorf("未回积分时应显示 credit=-（不编造 0）:\n%s", out)
 	}
 }

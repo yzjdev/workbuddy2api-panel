@@ -31,6 +31,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	qoderpkg "github.com/linguo2625469/workbuddy2api-panel/internal/upstream/qoder"
+	traepkg "github.com/linguo2625469/workbuddy2api-panel/internal/upstream/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
@@ -41,6 +42,12 @@ type Config struct {
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
+	// Listen 主服务的监听地址（如 ":8787" / "127.0.0.1:8787"）。
+	//
+	// 用途只有一个：TRAE 授权登录的回调地址要指向**本进程已在监听的端口**，
+	// 复用 API 端口即可（回调路径 /authorize 由面板 mux 与 server mux 共同承载），
+	// 不必再单独起 18080。空值 = 无法推导 → 回退独立本地监听。
+	Listen    string
 	RedisMode string               // "upstash" / "noop"，仅观测透出
 	Version   string               // 面板版本号（展示用）
 
@@ -90,6 +97,14 @@ type Panel struct {
 	// 本地 device flow（不依赖 workbuddy 上游 state 端点），容量天然有界。
 	qoderLoginMu sync.Mutex
 	qoderLogins  map[string]qoderLoginSession
+
+	// traeLogins 进行中的 TRAE 授权登录会话（state → 会话）。
+	// TRAE 走「本地回调直传 token」：回调与前端轮询是两个请求，结果经会话传递。
+	traeLoginMu sync.Mutex
+	traeLogins  map[string]*traeLoginSession
+	// traeCallback* 本地回调服务（127.0.0.1:18080）：懒启动、只起一次。
+	traeCallbackOnce sync.Once
+	traeCallbackErr  error
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -150,6 +165,7 @@ func New(cfg Config) *Panel {
 		logs:        NewRing(500),
 		logins:      map[string]loginSession{},
 		qoderLogins: map[string]qoderLoginSession{},
+		traeLogins:  map[string]*traeLoginSession{},
 	}
 	p.routes()
 	return p
@@ -173,6 +189,16 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/qoder/login/start", p.withAuth(p.qoderLoginStart))
 	p.mux.HandleFunc("GET /panel/api/qoder/login/poll", p.withAuth(p.qoderLoginPoll))
 	p.mux.HandleFunc("POST /panel/api/qoder/pat", p.withAuth(p.qoderPATAdd))
+	// TRAE 授权登录：start / poll 走面板鉴权；回调由**独立的本地监听服务**
+	// （127.0.0.1:18080/authorize，见 ensureTraeCallback）承载 —— 授权页只认
+	// 该形态的回调地址，故不挂在面板路由上。
+	p.mux.HandleFunc("POST /panel/api/trae/login/start", p.withAuth(p.traeLoginStart))
+	p.mux.HandleFunc("GET /panel/api/trae/login/poll", p.withAuth(p.traeLoginPoll))
+	// 粘贴回调链接兜底：本地 18080 不可用（被占用/跨机访问）时由服务端完成换 token。
+	p.mux.HandleFunc("POST /panel/api/trae/login/paste", p.withAuth(p.traeLoginPaste))
+	// 回调路径 /authorize 同时注册在面板 mux 与独立 18080 监听上：
+	// 前者供主端口直接命中（便于反代/调试），后者是 TRAE 登录页实际回跳的落点。
+	p.mux.HandleFunc("GET "+traepkg.CallbackPath, p.traeCallbackHandler)
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -584,6 +610,69 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// TRAE 账号：动态拉 SOLO 目录（get_detail_param），失败回落兜底目录。
+	// id 前缀与路由前缀一致（trae:xxx 可直接点用）。
+	for _, s := range p.cfg.Pool.List() {
+		a := p.cfg.Pool.AuthByUID(s.UID)
+		if a == nil || !a.IsTrae() {
+			continue
+		}
+		hasRelay = true
+		entries, err := traepkg.NewClient(nil).FetchModels(traeAccountView(a))
+		if err != nil || len(entries) == 0 {
+			if err != nil {
+				fetchErrs = append(fetchErrs, "trae: models: "+err.Error())
+			}
+			entries = traepkg.FallbackModels()
+		}
+		for _, m := range entries {
+			entry := map[string]any{
+				"id":                 "trae:" + m.ID,
+				"name":               m.Name,
+				"realm":              "trae",
+				"vendor":             "TRAE",
+				"relay_uid":          a.UID,
+				"supports_images":    m.Multimodal,
+				"supports_reasoning": len(m.ReasoningEfforts) > 0,
+			}
+			// 上下文档位：常规档作 context_length；Max 模式档单独透出（不混用）。
+			if m.ContextWindow > 0 {
+				entry["context_length"] = m.ContextWindow
+			}
+			if m.MaxMode && m.MaxContextWindow > 0 {
+				entry["max_mode"] = true
+				entry["max_context_length"] = m.MaxContextWindow
+			}
+			if m.MaxTokens > 0 {
+				entry["max_output_tokens"] = m.MaxTokens
+			}
+			if m.MaxModeOutputTokens > 0 {
+				entry["max_mode_output_tokens"] = m.MaxModeOutputTokens
+			}
+			// 思考档位（空 = 该模型不提供推理等级，前端不渲染选择器）。
+			if len(m.ReasoningEfforts) > 0 {
+				entry["supported_efforts"] = m.ReasoningEfforts
+				if m.DefaultEffort != "" {
+					entry["default_effort"] = m.DefaultEffort
+				}
+			}
+			// 倍率：0 是合法值（免费），故用 HasCredits 区分「免费」与「没取到」。
+			if m.HasCredits {
+				entry["credits"] = formatFactorText(m.CreditsRate) + "x"
+				// 活动折扣：只有真的降价（原价 > 现价）才展示划线牌价。
+				if m.OriginalCreditsRate > 0 && m.OriginalCreditsRate > m.CreditsRate {
+					entry["promo_factor"] = m.CreditsRate
+					entry["promo_credits"] = formatFactorText(m.CreditsRate) + "x"
+					entry["promo_label"] = "限时折扣"
+					if m.PromoEndsAt > 0 {
+						entry["promo_note"] = "截止 " + time.Unix(m.PromoEndsAt, 0).Format("2006-01-02 15:04")
+					}
+				}
+			}
+			out = append(out, entry)
+		}
+	}
+
 	if len(out) == 0 && !hasRelay {
 		if len(fetchErrs) > 0 {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
@@ -840,6 +929,40 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
+	// TRAE 账号：独立签到体系（UG 接口，Cloud-IDE-JWT + X-User-Region），
+	// 签到后顺带刷新积分快照——用户点一次「签到」就能同时拿到最新积分。
+	if a.IsTrae() {
+		acct := traeAccountView(a)
+		client := traepkg.NewClient(nil)
+		if checkedIn, _, enable, err := client.CheckinStatus(acct); err != nil {
+			checkinMsg = err.Error()
+		} else if checkedIn {
+			checkinMsg = "今日已签到"
+			checkinDone = true
+			p.cfg.Pool.NoteCheckinDone(uid)
+		} else if !enable {
+			checkinMsg = "签到未启用"
+		} else if err := client.CheckinClaim(acct); err != nil {
+			checkinMsg = err.Error()
+		} else {
+			checkinMsg = "签到成功"
+			checkinDone = true
+			p.cfg.Pool.NoteCheckinDone(uid)
+		}
+		resp := map[string]any{"ok": true, "checkin_done": checkinDone, "checkin_message": checkinMsg}
+		if remain, limit, _, packs, err := client.EntUsage(acct); err != nil {
+			resp["balance_error"] = err.Error()
+		} else if packs > 0 {
+			p.cfg.Pool.ReenableIfCredits(uid, remain, limit)
+			p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{Remain: remain, Total: limit})
+			resp["credits"] = remain
+			resp["credits_total"] = limit
+			resp["packages"] = packs
+		}
+		log.Printf("panel: trae checkin uid=%s msg=%q", uid, checkinMsg)
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
 	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
@@ -892,7 +1015,26 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	if a.IsRelay() || a.IsQoder() {
+	if a.IsTrae() {
+		// TRAE 有独立积分接口（ide_user_ent_usage）：走它而不是 workbuddy 的
+		// get-user-resource；remain/total 口径与周期刷新一致（Σ limit - Σ used / Σ limit）。
+		remain, limit, _, packs, err := traepkg.NewClient(nil).EntUsage(traeAccountView(a))
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "trae ent usage: "+err.Error())
+			return
+		}
+		if packs == 0 {
+			writeErr(w, http.StatusBadGateway, "上游未返回权益包（可能 token 失效或账号无额度）")
+			return
+		}
+		p.cfg.Pool.ReenableIfCredits(uid, remain, limit)
+		p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{Remain: remain, Total: limit})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "credits": remain, "credits_total": limit, "packages": packs,
+		})
+		return
+	}
+	if a.IsUpstreamOnly() {
 		writeErr(w, http.StatusBadRequest, "中转账号无 workbuddy 积分/余额体系，不支持余额刷新")
 		return
 	}
@@ -1236,7 +1378,7 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	rowCount := 0 // relay 账号被跳过后，实际写入 out 的行数
 	for i, s := range accts {
 		a := p.cfg.Pool.AuthByUID(s.UID)
-		if a != nil && (a.IsRelay() || a.IsQoder()) {
+		if a != nil && (a.IsUpstreamOnly()) {
 			continue // 中转账号无 workbuddy 积分包/到期体系，不发起上游查询
 		}
 		j := rowCount

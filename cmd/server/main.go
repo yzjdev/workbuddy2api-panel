@@ -29,6 +29,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	qoderpkg "github.com/linguo2625469/workbuddy2api-panel/internal/upstream/qoder"
+	traepkg "github.com/linguo2625469/workbuddy2api-panel/internal/upstream/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
@@ -303,6 +304,9 @@ func main() {
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
 		APIKey:      cfg.APIKey,
+		// TRAE 授权登录的回调复用本进程已在监听的端口（路径 /authorize），
+		// 不需要额外开 18080；Listen 为空时才回退独立本地监听。
+		Listen:      cfg.Listen,
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
@@ -333,6 +337,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		Qoder:        qoderpkg.NewClient(nil),
+		Trae:         traepkg.NewClient(nil),
 		APIKey:       cfg.APIKey,
 		Session:      sessRouter,
 		StickyCount:  sessCount,

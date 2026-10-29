@@ -483,6 +483,12 @@ process.stdout.write(JSON.stringify({
   rate: state(model('global:glm-5.3'), [], [{ model: 'global:glm-5.3', status: 429 }]),
   upstream: state(model('global:glm-5.3'), [], [{ model: 'global:glm-5.3', status: 503 }]),
   ok: state(model('global:ok'), [], success),
+  // TRAE：id 是 config_name（trae:glm-5.2），但用户可能照展示名（trae:GLM-5.2）
+  // 或裸名（glm-5.2）调用；三种等价形态都应认成「有真实证据」。
+  traeByName: state({ id: 'trae:glm-5.2', name: 'GLM-5.2' }, [], [{ model: 'TRAE:GLM-5.2', status: 200, outcome: 'success' }]),
+  traeBare: state({ id: 'trae:glm-5.2', name: 'GLM-5.2' }, [], [{ model: 'glm-5.2', status: 200, outcome: 'success' }]),
+  traeLock: state({ id: 'trae:glm-5.2', name: 'GLM-5.2' }, [{ realm: 'trae', model: 'glm-5.2', state: 'locked', reason: 'trae soft-rate' }], []),
+  traeUnknown: state({ id: 'trae:glm-5.2', name: 'GLM-5.2' }, [], []),
   deniedTag: deniedTag.includes('无权限') && deniedTag.includes('tag bad'),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "model-availability-*.cjs")
@@ -497,7 +503,7 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("model availability node test failed: %v\n%s", err, out)
 	}
-	const want = `{"cn":null,"unknown":"unknown","denied":"denied","missing":"missing","partial":"partial","starved":"starved","rate":"rate","upstream":"upstream","ok":"ok","deniedTag":true}`
+	const want = `{"cn":null,"unknown":"unknown","denied":"denied","missing":"missing","partial":"partial","starved":"starved","rate":"rate","upstream":"upstream","ok":"ok","traeByName":"ok","traeBare":"ok","traeLock":"limited","traeUnknown":"unknown","deniedTag":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("model availability=%s want %s", out, want)
 	}
